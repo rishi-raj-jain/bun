@@ -374,7 +374,7 @@ pub struct DebugOptions {
     pub use_system_shell: bool,
 
     // technical debt
-    pub macros: MacroOptions,
+    pub macros: Option<MacroMap>,
     pub editor: Box<[u8]>,
     pub package_bundle_map: ArrayHashMap<Box<[u8]>, bundle_enums::BundlePackage>,
 
@@ -398,7 +398,7 @@ impl Default for DebugOptions {
             run_in_bun: false,
             loaded_bunfig: false,
             use_system_shell: !cfg!(windows),
-            macros: MacroOptions::Unspecified,
+            macros: None,
             editor: Box::default(),
             package_bundle_map: ArrayHashMap::default(),
             test_directory: Box::default(),
@@ -407,10 +407,13 @@ impl Default for DebugOptions {
     }
 }
 
-pub enum MacroOptions {
-    Unspecified,
-    Disable,
-    Map(MacroMap),
+impl DebugOptions {
+    /// The `[macros]` table of bunfig.toml, which is off while macros are: an import it names is then an ordinary import.
+    pub fn macro_remap(&self) -> Option<&MacroMap> {
+        self.macros
+            .as_ref()
+            .filter(|_| !bun_core::js_macros_disabled())
+    }
 }
 
 /// Plain hashmap aliases re-declared here so this

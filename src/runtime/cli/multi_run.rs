@@ -805,11 +805,14 @@ fn add_script_configs<V: core::ops::Deref<Target = [u8]>>(
     } else {
         // Not a package.json script - run as a raw command
         // If it looks like a file path, prefix with bun executable
-        let is_file = !raw_name.is_empty()
-            && (raw_name[0] == b'.'
-                || raw_name[0] == b'/'
-                || (cfg!(windows) && raw_name[0] == b'\\')
-                || has_runnable_extension(raw_name));
+        let looks_like_file = |name: &[u8]| {
+            !name.is_empty()
+                && (name[0] == b'.'
+                    || name[0] == b'/'
+                    || (cfg!(windows) && name[0] == b'\\')
+                    || has_runnable_extension(name))
+        };
+        let is_file = looks_like_file(raw_name);
         let command_z: Box<[u8]> = if is_file {
             let bun_path: &[u8] = bun::self_exe_path().map(|z| z.as_bytes()).unwrap_or(b"bun");
             // Quote the bun path so that backslashes on Windows are not
@@ -818,6 +821,15 @@ fn add_script_configs<V: core::ops::Deref<Target = [u8]>>(
             v.push(b'"');
             v.extend_from_slice(bun_path);
             v.extend_from_slice(b"\" ");
+            // `"x tool a.js"` is a file by its last word only: `x` is a command of `bun`, which can refuse a flag here.
+            let first_word =
+                strings::index_of_any(raw_name, b" \t").map_or(raw_name, |end| &raw_name[..end]);
+            if looks_like_file(first_word) {
+                for flag in bun::process_switches::flags_for_child() {
+                    v.extend_from_slice(flag.to_bytes());
+                    v.push(b' ');
+                }
+            }
             v.extend_from_slice(raw_name);
             v.push(0);
             v.into_boxed_slice()

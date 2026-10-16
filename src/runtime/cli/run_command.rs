@@ -820,7 +820,6 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
     /// Shared ctx→transpiler/resolver option projection used by [`boot`] and
     /// [`boot_standalone`].
     fn wire_transpiler_from_ctx(b: &mut Transpiler<'_>, ctx: &mut ContextData) {
-        use bun_options_types::context::MacroOptions;
         use bun_options_types::offline_mode::OfflineMode;
 
         // `BundleOptions::install` is a raw `NonNull` backref into
@@ -846,25 +845,8 @@ Full documentation is available at <magenta>https://bun.com/docs/cli/run<r>
         // resolver's forward-decl `BundleOptions` does not project
         // `minify_*` (resolver never reads them).
 
-        match &mut ctx.debug.macros {
-            MacroOptions::Disable => b.options.no_macros = true,
-            MacroOptions::Map(macros) => {
-                // `ContextData::MacroMap` and
-                // `BundleOptions::macro_remap` are both
-                // `ArrayHashMap<Box<[u8]>, ArrayHashMap<Box<[u8]>, Box<[u8]>>>`
-                // but with different hasher contexts (`Auto` vs
-                // `BoxedSliceContext`), so re-seat by iterating instead of move.
-                // Cold path (only hit when bunfig declares `[macros]`).
-                for (k, v) in macros.iter() {
-                    let mut inner =
-                        bun_resolver::package_json::MacroImportReplacementMap::default();
-                    for (ik, iv) in v.iter() {
-                        inner.put(ik, iv.clone()).unwrap_or_oom();
-                    }
-                    b.options.macro_remap.put(k, inner).unwrap_or_oom();
-                }
-            }
-            MacroOptions::Unspecified => {}
+        if let Some(table) = ctx.debug.macro_remap() {
+            b.options.set_macro_remap(table);
         }
     }
 
