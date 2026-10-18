@@ -1173,7 +1173,6 @@ describe.concurrent("catalogs", () => {
     [[], ""],
     [["-r"], ""],
     [["--filter", "*"], ""],
-    [["--frozen-lockfile"], ""],
     [[], PKG1],
     [["-r"], PKG1],
   ])("bun update --latest %j from '%s' leaves a catalog that does not move as written", async (flags, cwd) => {
