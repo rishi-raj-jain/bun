@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { bunEnv, bunExe, isASAN, isDebug, normalizeBunSnapshot, tempDir } from "harness";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { endChildren, spawn } from "../children";
 
@@ -18,8 +18,13 @@ const env = {
   FORCE_COLOR: undefined,
 };
 
+type Run = Awaited<ReturnType<typeof lint>>;
+
 async function lint(files: Record<string, string | Buffer>, args: string[], reads: string[] = [], stdin?: string) {
   using dir = tempDir("bun-lint-js-parsers", files);
+  // The names that the output can have for the directory: with its links resolved, and as it is. They are looked up here
+  // because the directory is gone by the time a test reads the output.
+  const names = [realpathSync.native(String(dir)).replaceAll("\\", "/"), String(dir)];
   await using proc = spawn({
     cmd: [bunExe(), "lint", ...(args.includes("--threads") ? [] : ["--threads", "2"]), ...args],
     env,
@@ -31,19 +36,68 @@ async function lint(files: Record<string, string | Buffer>, args: string[], read
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
   // Where a run ends with an error, or dies, the assertion that fails is often about something else.
   if (exitCode !== 0 && exitCode !== 1) console.error(`bun lint ${args.join(" ")}: exit code ${exitCode}\n${stderr}`);
+  // Normalized when a test first reads them, and not before. For megabytes of output that takes seconds in a debug build,
+  // and no other test runs in that time. Most tests read `raw`.
+  const shown = (text: string) =>
+    once(() => normalizeBunSnapshot(names.reduce((text, name) => text.replaceAll(name, "<dir>"), text)));
+  const [shownStdout, shownStderr] = [shown(stdout), shown(stderr)];
   return {
     raw: stdout,
-    stdout: normalizeBunSnapshot(stdout, String(dir)),
-    stderr: normalizeBunSnapshot(stderr, String(dir)),
+    get stdout() {
+      return shownStdout();
+    },
+    get stderr() {
+      return shownStderr();
+    },
     exitCode,
     files: Object.fromEntries(reads.map(name => [name, readFileSync(join(String(dir), name), "utf8")])),
   };
 }
 
+/**
+ * Calls `make` when its value is first asked for, and never again. A run that several tests read is started this way: the
+ * first test that asks starts it, and all of them get that one promise.
+ */
+function once<T>(make: () => T) {
+  let made: { value: T } | undefined;
+  return () => (made ??= { value: make() }).value;
+}
+
+type Message = {
+  ruleId: string | null;
+  severity: number;
+  message: string;
+  line: number;
+  column: number;
+  fatal?: boolean;
+  fix?: { range: [number, number]; text: string };
+  suggestions?: unknown[];
+  suppressions?: { justification: string }[];
+};
+type Result = { filePath: string; messages: Message[]; suppressedMessages: Message[]; errorCount: number };
+
+/**
+ * What a `-f json` run printed. The run has to end the way a run with these results ends: standard error has the last line,
+ * which counts the files, and nothing else, and the exit code is 1 only if a problem is an error.
+ */
+function resultsOf(run: Run): Result[] {
+  // A run that was refused, or that died, printed no results. What it said tells more than a syntax error in JSON does.
+  if (run.exitCode !== 0 && run.exitCode !== 1) throw new Error(`bun lint: exit code ${run.exitCode}\n${run.stderr}`);
+  const results: Result[] = JSON.parse(run.raw);
+  const found = results.flatMap(it => it.messages);
+  const files = `${results.length} file${results.length === 1 ? "" : "s"}`;
+  expect({ stderr: run.stderr, exitCode: run.exitCode }).toEqual({
+    stderr: found.length > 0 ? `Linted ${files}` : `✓ No problems in ${files}`,
+    exitCode: found.some(it => it.severity === 2) ? 1 : 0,
+  });
+  return results;
+}
+
 // `file: line:column rule message`, with what else there is to a message.
-function summary(json: string) {
+function summary(json: string | Result[]) {
   const lines: string[] = [];
-  for (const { filePath, messages, suppressedMessages } of JSON.parse(json)) {
+  const results: Result[] = typeof json === "string" ? JSON.parse(json) : json;
+  for (const { filePath, messages, suppressedMessages } of results) {
     for (const it of [...messages, ...suppressedMessages]) {
       const extras = [
         it.fatal && "fatal",
@@ -57,6 +111,12 @@ function summary(json: string) {
   }
   return lines.join("\n");
 }
+
+/** The `summary` of a `-f json` run that ends the way `resultsOf` says. */
+const problems = (run: Run) => summary(resultsOf(run));
+
+/** The path of a result from the directory of its run. */
+const pathOf = (it: Result) => it.filePath.replaceAll("\\", "/").replace(/^.*\/bun-lint-js-parsers_\w+\//, "");
 
 // Each thread that needs JavaScript starts a VM, which takes seconds in a debug build.
 const timeout = isDebug || isASAN ? 120_000 : 10_000;
@@ -143,8 +203,7 @@ describe.concurrent("bun lint with processors", () => {
         },
         ["-f", "json", "a.md", "b.js"],
       );
-      expect(result.stderr).not.toContain("error");
-      expect(summary(result.raw)).toMatchInlineSnapshot(`
+      expect(problems(result)).toMatchInlineSnapshot(`
         "a.md: 4:1 no-var Unexpected var, use let or const instead. [fix 13,16 "let"]
         a.md: 15:15 no-var Unexpected var, use let or const instead. [fix 129,132 "let"]
         a.md: 15:25 eqeqeq Expected '===' and instead saw '=='. [1 suggestion]
@@ -194,6 +253,7 @@ describe.concurrent("bun lint with processors", () => {
         "a.md: 15:25 eqeqeq Expected '===' and instead saw '=='. [1 suggestion]
         a.md: 7:3 eqeqeq Expected '===' and instead saw '=='. [1 suggestion] [suppressed: why not]"
       `);
+      expect(result.stderr).toBe("Fixed 2 problems in 1 file\nLinted 1 file");
       expect(result.exitCode).toBe(1);
     },
     timeout,
@@ -214,7 +274,7 @@ describe.concurrent("bun lint with processors", () => {
         ["a.md"],
       );
       expect(result.files["a.md"]).toBe(markdown);
-      expect(summary(result.raw)).toMatchInlineSnapshot(`
+      expect(problems(result)).toMatchInlineSnapshot(`
         "a.md: 4:1 no-var Unexpected var, use let or const instead.
         a.md: 15:15 no-var Unexpected var, use let or const instead.
         a.md: 15:25 eqeqeq Expected '===' and instead saw '=='.
@@ -245,16 +305,21 @@ describe.concurrent("bun lint with processors", () => {
         "b.halves": "var a;\n~~~\nlet b;\nvar c;\n",
         "c.none": "",
       };
-      const result = await lint(files, ["-f", "json", "a.md", "b.halves"]);
-      expect(summary(result.raw)).toMatchInlineSnapshot(`
+      const [result, missing] = await Promise.all([
+        lint(files, ["-f", "json", "a.md", "b.halves"]),
+        lint(files, ["c.none"]),
+      ]);
+      expect(problems(result)).toMatchInlineSnapshot(`
         "a.md: 3:7 null Preprocessing error: It is broken. [fatal]
         b.halves: 1:1 no-var Unexpected var, use let or const instead.
         b.halves: 2:1 no-var Unexpected var, use let or const instead."
       `);
       expect(result.exitCode).toBe(1);
-      const missing = await lint(files, ["c.none"]);
-      expect(missing.stderr).toContain(`Key "processor": Could not find "none" in plugin "fenced".`);
-      expect(missing.exitCode).toBe(2);
+      expect(missing).toMatchObject({
+        stdout: "",
+        stderr: `error: Key "processor": Could not find "none" in plugin "fenced".`,
+        exitCode: 2,
+      });
     },
     timeout,
   );
@@ -291,7 +356,7 @@ describe.concurrent("bun lint with processors", () => {
         },
         ["-f", "json", "docs/a.md", "b.js"],
       );
-      expect(summary(result.raw)).toMatchInlineSnapshot(`
+      expect(problems(result)).toMatchInlineSnapshot(`
         "b.js: 1:1 names/names b.js in b.js
         a.md: 2:1 names/names docs/a.md/0_block.js in docs/a.md"
       `);
@@ -319,13 +384,12 @@ describe.concurrent("bun lint with processors", () => {
         "a.md": "```js\nvar a;\n```\n",
         "b.txt": "var b;\n",
       };
-      const result = await lint(files, ["-f", "json", "a.md"]);
-      expect(summary(result.raw)).toMatchInlineSnapshot(
+      const [result, whole] = await Promise.all([lint(files, ["-f", "json", "a.md"]), lint(files, ["b.txt"])]);
+      expect(problems(result)).toMatchInlineSnapshot(
         `"a.md: 2:1 no-var Unexpected var, use let or const instead. [fix 6,9 "let"]"`,
       );
       expect(result.exitCode).toBe(1);
       // What the processor gives back without a name is for the language.
-      const whole = await lint(files, ["b.txt"]);
       expect(whole.stderr).toContain(
         "1 file was not linted because it needs eslint, which is not installed (1 *.txt): b.txt",
       );
@@ -411,12 +475,11 @@ describe.concurrent("bun lint with languages", () => {
     "a file in the language of a plugin is linted by the Linter of the eslint that is installed",
     async () => {
       const result = await lint({ ...eslintPackage, ...lines }, ["-f", "json", "a.js", "b.txt"]);
-      expect(summary(result.raw)).toMatchInlineSnapshot(`
+      expect(problems(result)).toMatchInlineSnapshot(`
         "a.js: 1:1 no-var Unexpected var, use let or const instead. [fix 0,3 "let"]
         b.txt: 2:1 lines/no-tabs tab o 4 s b.txt [fix 4,5 " "]
         b.txt: 3:1 lines/no-tabs tab o 4 s b.txt [fix 10,11 " "] [suppressed: ]"
       `);
-      expect(result.stderr).not.toContain("not linted");
       expect(result.exitCode).toBe(1);
     },
     timeout,
@@ -486,6 +549,9 @@ describe.concurrent("bun lint with languages", () => {
           ? []
           : ["c.vue: 1:1 null Unused eslint-disable directive (no problems were reported from 'semi' or 'no-var')."]),
       ]);
+      expect(result.stderr).toBe(
+        "Linted 1 file\nnote: 2 deprecated formatting rules did not run: indent, semi\n  Use bun fmt instead.",
+      );
       expect(result.exitCode).toBe(1);
     },
     timeout,
@@ -564,6 +630,7 @@ describe.concurrent("bun lint with languages", () => {
 
         2 problems"
       `);
+      expect(result.stderr).toBe("Linted 2 files");
       expect(result.exitCode).toBe(1);
     },
     timeout,
@@ -624,6 +691,7 @@ describe.concurrent("bun lint with languages", () => {
 
         1 problem"
       `);
+      expect(result.stderr).toBe("Linted 1 file");
       expect(result.exitCode).toBe(1);
     },
     timeout,
@@ -689,9 +757,7 @@ rules = { "no-console" = "off" }
 `;
     /** Returns the files under tree/ that have a problem. */
     async function reported(files: Record<string, string>, args: string[]) {
-      const { raw, stderr, exitCode } = await lint({ ...strictEslint, ...tree, ...files }, ["-f", "json", ...args]);
-      expect({ stderr: stderr.replace(/^Linted .*$/m, ""), exitCode }).toEqual({ stderr: "", exitCode: 1 });
-      const results: { filePath: string; messages: unknown[] }[] = JSON.parse(raw);
+      const results = resultsOf(await lint({ ...strictEslint, ...tree, ...files }, ["-f", "json", ...args]));
       const names = results.filter(it => it.messages.length > 0).map(it => it.filePath.replaceAll("\\", "/"));
       return names.map(it => it.slice(it.indexOf("/tree/") + "/tree/".length)).sort();
     }
@@ -748,10 +814,12 @@ rules = { "no-console" = "off" }
         });
         const globs = `["+(a|b)/**", "f{1..3}.*"]`;
         const args = ["--cwd", "tree/globs", "."];
-        expect(await reported(override(`files = ${globs}`), args)).toEqual(both(["c/x", "f4"]));
-        expect(await reported(override(`files = "**/*"\nexcludeFiles = ${globs}`), args)).toEqual(
-          both(["a/x", "ab/x", "f1", "f3"]),
-        );
+        const [included, excluded] = await Promise.all([
+          reported(override(`files = ${globs}`), args),
+          reported(override(`files = "**/*"\nexcludeFiles = ${globs}`), args),
+        ]);
+        expect(included).toEqual(both(["c/x", "f4"]));
+        expect(excluded).toEqual(both(["a/x", "ab/x", "f1", "f3"]));
       },
       timeout,
     );
@@ -821,13 +889,13 @@ rules = { "no-console" = "off" }
       const text = Buffer.alloc(250_000, "<!-- comment -->\n").toString();
       for (let i = 0; i < 24; i++) files[`typed/${i}.vue`] = files[`plain/${i}.vue`] = text;
       const realms = async (directory: string) => {
-        const result = await lint(files, ["-f", "json", "--threads", "8", directory]);
-        expect(result.exitCode).toBe(1);
-        const messages = JSON.parse(result.raw).flatMap((it: any) => it.messages.map((it: any) => it.message));
+        const results = resultsOf(await lint(files, ["-f", "json", "--threads", "8", directory]));
+        const messages = results.flatMap(it => it.messages.map(it => it.message));
         return [messages.length, new Set(messages).size];
       };
-      expect(await realms("typed")).toEqual([24, 1]);
-      expect((await realms("plain"))[0]).toBe(24);
+      const [typed, plain] = await Promise.all([realms("typed"), realms("plain")]);
+      expect(typed).toEqual([24, 1]);
+      expect(plain[0]).toBe(24);
     },
     timeout,
   );
@@ -837,6 +905,8 @@ rules = { "no-console" = "off" }
     async () => {
       const result = await lint({ ...eslintPackage, ...lines }, ["--fix", "b.txt"], ["b.txt"]);
       expect(result.files).toEqual({ "b.txt": "one\n two \n\tthree # off\n" });
+      // Two passes: the rule reports one tab of a line at a time.
+      expect(result.stderr).toBe("Fixed 2 problems in 1 file\n✓ No problems in 1 file");
       expect(result.exitCode).toBe(0);
     },
     timeout,
@@ -846,7 +916,9 @@ rules = { "no-console" = "off" }
     "without the package eslint such files are named, and the others are linted",
     async () => {
       const result = await lint(lines, ["-f", "unix", "a.js", "b.txt"]);
-      expect(result.stdout).toContain("a.js:1:1: Unexpected var, use let or const instead. [Error/no-var]");
+      expect(result.stdout).toBe(
+        "<dir>/a.js:1:1: Unexpected var, use let or const instead. [Error/no-var]\n\n1 problem",
+      );
       expect(result.stderr).toContain(
         "1 file was not linted because it needs eslint, which is not installed (1 *.txt): b.txt\n  Run bun add -d eslint",
       );
@@ -921,7 +993,8 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       endLine: 2,
       endColumn: 26,
     });
-    expect(result.stderr).not.toContain("the eslint package linted");
+    // `--timing` says what ran JavaScript: nothing did.
+    expect(result.stderr).toContain("JavaScript: 0 engines loaded 0 modules");
     expect(result.exitCode).toBe(1);
   });
 
@@ -930,7 +1003,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
     const keys = Array.from({ length: count }, (_, i) => `"k${i}": ${i}`);
     const text = `{${keys.join(",")},"k7":0,"k${count - 1}":0,"new":0}`;
     const result = await lint({ ...json, "a.json": text }, ["-f", "json", "."]);
-    expect(summary(result.raw).replaceAll(/\d+:\d+ /g, "")).toBe(
+    expect(problems(result).replaceAll(/\d+:\d+ /g, "")).toBe(
       `a.json: json/no-duplicate-keys Duplicate key "k7" found.\na.json: json/no-duplicate-keys Duplicate key "k${count - 1}" found.`,
     );
   });
@@ -939,7 +1012,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
     const depth = many(200_000);
     const deep = `${repeated('{"a":[', depth)}{"b":1,"b":2}${repeated("]}", depth)}`;
     const result = await lint({ ...json, "a.json": deep }, ["-f", "json", "."]);
-    expect(summary(result.raw)).toBe(`a.json: 1:${depth * 6 + 8} json/no-duplicate-keys Duplicate key "b" found.`);
+    expect(problems(result)).toBe(`a.json: 1:${depth * 6 + 8} json/no-duplicate-keys Duplicate key "b" found.`);
   });
 
   // Bun has to reject the same inputs as the plugin. The message and its location come from Bun's parser.
@@ -987,7 +1060,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
     ];
     const files = cases.map(([language, text], i) => [`${String(i).padStart(2, "0")}.${language}`, text]);
     const result = await lint({ ...json, ...Object.fromEntries(files) }, ["-f", "json", "."]);
-    expect(summary(result.raw).split("\n")).toEqual(
+    expect(problems(result).split("\n")).toEqual(
       cases.map(([, , expected], i) => {
         const [place, ...message] = expected.split(" ");
         return `${files[i][0]}: ${place} null Parsing error: ${message.join(" ")} [fatal]`;
@@ -1249,9 +1322,9 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
     const config = jsonConfig(`{ files: ["commas/*.jsonc"], languageOptions: { allowTrailingCommas: true } }`);
     const result = await lint({ ...json, "eslint.config.mjs": config, ...files }, ["-f", "json", "."]);
     const found = new Map<string, string>();
-    for (const { filePath, messages } of JSON.parse(result.raw)) {
+    for (const { filePath, messages } of resultsOf(result)) {
       // A rejected file gets exactly one problem.
-      const isRefused = messages.some((it: any) => it.fatal);
+      const isRefused = messages.some(it => it.fatal);
       found.set(
         filePath.replaceAll("\\", "/").split("/").slice(-2).join("/"),
         isRefused ? "r".repeat(messages.length) : "a",
@@ -1299,10 +1372,10 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
     ];
     const files = cases.map(([language, text], i) => [`${String(i).padStart(2, "0")}.${language}`, text]);
     const result = await lint({ ...json, ...Object.fromEntries(files) }, ["-f", "json", "."]);
-    const found = JSON.parse(result.raw)
-      .filter((it: any) => /\d\d\.json[c5]?$/.test(it.filePath))
-      .map((it: any) => (it.messages.some((it: any) => it.fatal) ? "refused" : "accepted"));
-    expect(found.map((it: string, i: number) => `${JSON.stringify(cases[i][1])} in ${cases[i][0]}: ${it}`)).toEqual(
+    const found = resultsOf(result)
+      .filter(it => /\d\d\.json[c5]?$/.test(it.filePath))
+      .map(it => (it.messages.some(it => it.fatal) ? "refused" : "accepted"));
+    expect(found.map((it, i) => `${JSON.stringify(cases[i][1])} in ${cases[i][0]}: ${it}`)).toEqual(
       cases.map(([language, text, expected]) => `${JSON.stringify(text)} in ${language}: ${expected}`),
     );
   });
@@ -1310,7 +1383,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
   test("parses JSON5-only syntax in JSON5", async () => {
     const text = `// c\n{ a: +1, b: .5, c: 5., d: 0xF, e: -Infinity, f: NaN, g: 'a\\\nb', "h": "\\x41\\v\\0", $_: [1,], NaN: 1, ${noBreakSpace}}\n`;
     const result = await lint({ ...json, "a.json5": text }, ["-f", "json", "."]);
-    expect(summary(result.raw)).toBe("");
+    expect(problems(result)).toBe("");
     expect(result.exitCode).toBe(0);
   });
 
@@ -1339,7 +1412,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
 
     test("report the same as in ESLint", async () => {
       const result = await lint(all, ["-f", "json", "."]);
-      expect(summary(result.raw).replace(/f{300}/, "f..f")).toMatchInlineSnapshot(`
+      expect(problems(result).replace(/f{300}/, "f..f")).toMatchInlineSnapshot(`
           "a.json: 2:8 json/no-unsafe-values The number '1e400' will evaluate to Infinity.
           a.json: 3:3 json/sort-keys Expected object keys to be in alphanumeric case-sensitive ascending order. 'a' should be before 'b'. [fix 4,39 "\\"a\\": 9007199254740993,\\n  \\"b\\": 1e400"]
           a.json: 3:8 json/no-unsafe-values The integer '9007199254740993' is outside the safe integer range.
@@ -1411,6 +1484,9 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
             "nfkc.json5": "{ '"': 1, "\\\\": 4, fi: 2, "\\ufb01": 3 }",
           }
         `);
+      // These four are all that it changed. What has no fix is left: the exit code says so.
+      expect(result.stderr).toMatch(/^Fixed \d+ problems in 4 files\nLinted 11 files$/);
+      expect(result.exitCode).toBe(1);
     });
 
     test.each([
@@ -1430,25 +1506,28 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
     ])("options are validated: %s", async (rule, expected) => {
       const config = jsonConfig(`{ files: ["**/*.json"], rules: { ${rule} } }`);
       const result = await lint({ ...json, "eslint.config.mjs": config, "a.json": "{}" }, ["a.json"]);
-      expect(result.stderr).toContain(`Key "rules": ${expected}`);
-      expect(result.exitCode).toBe(2);
+      expect(result).toMatchObject({
+        stdout: "",
+        stderr: `error: Invalid config in eslint.config.mjs\nKey "rules": ${expected}`,
+        exitCode: 2,
+      });
     });
 
     test("many keys out of order, with comments", async () => {
       const count = many(30_000);
       const keys = Array.from({ length: count }, (_, i) => `"k${count - i}": ${i}, // ${i}`);
-      const result = await lint({ ...all, "many.jsonc": `{\n${keys.join("\n")}\n"a": 1\n}` }, [
-        "-f",
-        "json",
-        "many.jsonc",
-      ]);
-      const { messages } = JSON.parse(result.raw)[0];
-      expect(messages.length).toBeGreaterThan(count / 2);
-      expect(messages.filter((it: any) => it.fix)).toEqual([]);
       // Only comments between two keys. A blank line there would start a new group.
       const apart = `{\n"b": 1,\n${repeated("// c\n/*\n\n*/\n", count)}"a": 2\n}`;
-      const groups = await lint({ ...all, "groups.jsonc": apart }, ["-f", "json", "groups.jsonc"]);
-      expect(JSON.parse(groups.raw)[0].messages.map((it: any) => it.line)).toEqual([count * 4 + 3]);
+      const [result, groups] = await Promise.all([
+        lint({ ...all, "many.jsonc": `{\n${keys.join("\n")}\n"a": 1\n}` }, ["-f", "json", "many.jsonc"]),
+        lint({ ...all, "groups.jsonc": apart }, ["-f", "json", "groups.jsonc"]),
+      ]);
+      const [{ messages }] = resultsOf(result);
+      // Every key but the first belongs before the one above it, except the ones like `k99`: as text it is after `k100`.
+      const inOrder = String(count).length - 1;
+      expect(messages.length).toBe(count - inOrder);
+      expect(messages.filter(it => it.fix)).toEqual([]);
+      expect(resultsOf(groups)[0].messages.map(it => it.line)).toEqual([count * 4 + 3]);
     });
   });
 
@@ -1464,7 +1543,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       },
       ["-f", "json", "."],
     );
-    expect(summary(result.raw)).toBe(
+    expect(problems(result)).toBe(
       `a.json: 1:23 json/no-duplicate-keys Duplicate key "${replaced.repeat(3)}" found.\n` +
         "b.json5: 1:3 null Parsing error: Unexpected character [fatal]",
     );
@@ -1482,7 +1561,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       },
       ["-f", "json", "."],
     );
-    expect(summary(result.raw)).toBe(
+    expect(problems(result)).toBe(
       [
         `line.jsonc: 1:11 json/no-duplicate-keys Duplicate key "a" found. [suppressed: a${separators}b]`,
         'next-line.jsonc: 2:11 json/no-duplicate-keys Duplicate key "a" found. [suppressed: b]',
@@ -1492,39 +1571,60 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
   });
 
   // Line numbers in problems go by the language's line breaks, so code that looks a line up in the text must too.
-  describe.each([
-    ["only line feeds", (text: string) => text],
-    ["a byte order mark", (text: string) => mark + text],
-    ["carriage returns", (text: string) => text.replaceAll("\n", "\r\n")],
-    ["both", (text: string) => mark + text.replaceAll("\n", "\r\n")],
-  ])("U+2028 and U+2029 aren't line breaks in JSON: a file with %s", (_, written) => {
-    // Unless the file is short, the linter counts lines without saving their offsets, so the formatter recomputes them.
-    const more = Array.from({ length: 50 }, (_, i) => `  "${i}": "${"-".repeat(40)}",\n`).join("");
-    const text = `{\n  "s": "${separators}",\n${more}  "a": 1,\n  "a": 2\n}\n`;
-    const files = { ...json, "a.json": written(text) };
+  const lineBreaks: [string, (text: string) => string][] = [
+    ["only line feeds", text => text],
+    ["a byte order mark", text => mark + text],
+    ["carriage returns", text => text.replaceAll("\n", "\r\n")],
+    ["both", text => mark + text.replaceAll("\n", "\r\n")],
+  ];
+  // Unless the file is short, the linter counts lines without saving their offsets, so the formatter recomputes them.
+  // Each file is ten lines longer than the one before it, so a line number in the output of a run belongs to one file.
+  const withLineBreaks = Object.fromEntries(
+    lineBreaks.map(([, written], nth) => {
+      const more = Array.from({ length: 50 + 10 * nth }, (_, i) => `  "${i}": "${"-".repeat(40)}",\n`).join("");
+      return [`${nth}.json`, written(`{\n  "s": "${separators}",\n${more}  "a": 1,\n  "a": 2\n}\n`)];
+    }),
+  );
+  // One run for each format lints the four files.
+  const formatted = Object.fromEntries(
+    ["pretty", "agent", "stylish", "json", "unix", "github", "checkstyle", "junit", "gitlab", "sarif"].map(format => [
+      format,
+      once(() => lint({ ...json, ...withLineBreaks }, ["-f", format, ...Object.keys(withLineBreaks)])),
+    ]),
+  );
 
-    test.each(["pretty", "agent"])("the code excerpt in %s", async format => {
-      const result = await lint(files, ["-f", format, "a.json"]);
-      const shown = result.stdout.split("\n").filter(line => line.includes('"a"') && !line.includes("Duplicate"));
-      expect(shown.at(-1)).toEndWith('"a": 2');
-      expect(result.stdout).toContain(format === "pretty" ? "a.json:54:3" : 'line="54" column="3"');
-    });
+  describe.each(lineBreaks.map(([name], nth) => [name, nth] as const))(
+    "U+2028 and U+2029 aren't line breaks in JSON: a file with %s",
+    (_, nth) => {
+      const line = 54 + 10 * nth;
 
-    test.each(["stylish", "json", "unix", "github", "checkstyle", "junit", "gitlab", "sarif"])("%s", async format => {
-      const result = await lint(files, ["-f", format, "a.json"]);
-      const places = {
-        stylish: "  54:3  error",
-        json: '"line":54,"column":3,"messageId":"duplicateKey","endLine":54,"endColumn":6',
-        unix: "a.json:54:3:",
-        github: "line=54,col=3,endLine=54,endColumn=6",
-        checkstyle: 'line="54" column="3"',
-        junit: "line 54, column 3",
-        gitlab: '"begin": 54',
-        sarif: '"startLine": 54',
-      };
-      expect(result.stdout).toContain(places[format as keyof typeof places]);
-    });
-  });
+      test.each(["pretty", "agent"])("the code excerpt in %s", async format => {
+        const result = await formatted[format]();
+        // The line of the problem, and the mark under where it starts.
+        expect(result.stdout).toContain(`${line} |   "a": 2\n       ^`);
+        expect(result.stdout).toContain(
+          format === "pretty" ? `${nth}.json:${line}:3` : `file="${nth}.json" line="${line}" column="3"`,
+        );
+        expect(result.exitCode).toBe(1);
+      });
+
+      test.each(["stylish", "json", "unix", "github", "checkstyle", "junit", "gitlab", "sarif"])("%s", async format => {
+        const result = await formatted[format]();
+        const places = {
+          stylish: `  ${line}:3  error`,
+          json: `"line":${line},"column":3,"messageId":"duplicateKey","endLine":${line},"endColumn":6`,
+          unix: `${nth}.json:${line}:3:`,
+          github: `line=${line},col=3,endLine=${line},endColumn=6`,
+          checkstyle: `line="${line}" column="3"`,
+          junit: `line ${line}, column 3`,
+          gitlab: `"begin": ${line}`,
+          sarif: `"startLine": ${line}`,
+        };
+        expect(result.stdout).toContain(places[format as keyof typeof places]);
+        expect(result.exitCode).toBe(1);
+      });
+    },
+  );
 
   test("comments disable and configure rules in JSONC and JSON5", async () => {
     const twice = '"a": 1, "a": 2';
@@ -1545,7 +1645,8 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       },
       ["-f", "json", "."],
     );
-    expect(summary(result.raw)).toMatchInlineSnapshot(`
+    const found = resultsOf(result);
+    expect(summary(found)).toMatchInlineSnapshot(`
       "block.jsonc: 5:1 json/no-duplicate-keys Duplicate key "a" found.
       block.jsonc: 3:11 json/no-duplicate-keys Duplicate key "a" found. [suppressed: ]
       line.json5: 2:11 json/no-duplicate-keys Duplicate key "a" found. [suppressed: ]
@@ -1562,7 +1663,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       unused.jsonc: 2:3 null Unused eslint-disable directive (no problems were reported from 'json/no-duplicate-keys'). [fix 4,54 " "]
       warn.jsonc: 2:11 json/no-duplicate-keys Duplicate key "a" found."
     `);
-    const severities = JSON.parse(result.raw).flatMap((it: any) => it.messages.map((it: any) => it.severity));
+    const severities = found.flatMap(it => it.messages.map(it => it.severity));
     expect(severities).toEqual([2, 2, 2, 2, 2, 2, 2, 1, 1]);
   });
 
@@ -1570,6 +1671,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
     const files = { "a.jsonc": `${mark}{ "é": 1 /* eslint-disable-line */ }\n` };
     const result = await lint({ ...json, ...files }, ["--fix", "."], ["a.jsonc"]);
     expect(result.files).toEqual({ "a.jsonc": `${mark}{ "é": 1   }\n` });
+    expect(result.stderr).toBe("Fixed 1 problem in 1 file\n✓ No problems in 2 files");
     expect(result.exitCode).toBe(0);
   });
 
@@ -1585,13 +1687,13 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       lint(files, ["-f", "json", "--no-inline-config", "."]),
       lint(files, ["-f", "json", "--report-unused-disable-directives-severity", "error", "b.jsonc"]),
     ]);
-    expect(summary(plain.raw)).toMatchInlineSnapshot(`
+    expect(problems(plain)).toMatchInlineSnapshot(`
       "b.jsonc: 1:12 null Unused eslint-disable directive (no problems were reported). [fix 11,33 " "]
       a.jsonc: 1:11 json/no-duplicate-keys Duplicate key "a" found.
       a.jsonc: 1:20 null '// eslint-disable-line' has no effect because you have 'noInlineConfig' setting in your config."
     `);
-    expect(summary(ignoring.raw)).toBe('a.jsonc: 1:11 json/no-duplicate-keys Duplicate key "a" found.');
-    expect(JSON.parse(strict.raw)[0].errorCount).toBe(1);
+    expect(problems(ignoring)).toBe('a.jsonc: 1:11 json/no-duplicate-keys Duplicate key "a" found.');
+    expect(resultsOf(strict)[0].errorCount).toBe(1);
   });
 
   test("languageOptions are interpreted by the language", async () => {
@@ -1608,51 +1710,55 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       lint(files("{ allowTrailingCommas: 1 }"), ["a.jsonc"]),
       lint(files("{ allowTrailingCommas: true }"), ["x.json"]),
     ]);
-    expect(summary(allowed.raw)).toBe("");
+    expect(problems(allowed)).toBe("");
     expect(allowed.exitCode).toBe(0);
+    expect(printed).toMatchObject({ stderr: "", exitCode: 0 });
     expect(JSON.parse(printed.raw).language).toBe("json/jsonc");
     expect(JSON.parse(printed.raw).languageOptions).toEqual({ allowTrailingCommas: true });
-    expect(summary(refused.raw)).toBe(
+    expect(problems(refused)).toBe(
       "a.jsonc: 1:10 null Parsing error: Trailing commas are not allowed in JSONC [fatal]",
     );
-    expect(wrong.stderr).toContain('Key "languageOptions": allowTrailingCommas must be a boolean if provided.');
-    expect(wrong.exitCode).toBe(2);
-    expect(elsewhere.stderr).toContain('Key "languageOptions": allowTrailingCommas option is only available in JSONC.');
-    expect(elsewhere.exitCode).toBe(2);
+    const invalid = "error: Invalid config in eslint.config.mjs";
+    expect(wrong).toMatchObject({
+      stdout: "",
+      stderr: `${invalid}\nKey "languageOptions": allowTrailingCommas must be a boolean if provided.`,
+      exitCode: 2,
+    });
+    expect(elsewhere).toMatchObject({
+      stdout: "",
+      stderr: `${invalid}\nKey "languageOptions": allowTrailingCommas option is only available in JSONC.`,
+      exitCode: 2,
+    });
   });
 
   test("--stdin, and a format that shows the code", async () => {
-    using dir = tempDir("bun-lint-js-parsers", json);
-    const run = async (format: string) => {
-      await using proc = spawn({
-        cmd: [bunExe(), "lint", "--stdin", "--stdin-filename", "x.jsonc", "-f", format],
-        env,
-        cwd: String(dir),
-        stdin: Buffer.from('{\n  "a": 1, // c\n  "a": 2\n}\n'),
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
-      expect(exitCode).toBe(1);
-      return normalizeBunSnapshot(stdout, String(dir));
-    };
+    const text = '{\n  "a": 1, // c\n  "a": 2\n}\n';
+    const run = (format: string) => lint(json, ["--stdin", "--stdin-filename", "x.jsonc", "-f", format], [], text);
     const [unix, pretty] = await Promise.all([run("unix"), run("pretty")]);
-    expect(unix).toMatchInlineSnapshot(`
+    expect(unix.stdout).toMatchInlineSnapshot(`
       "<dir>/x.jsonc:3:3: Duplicate key "a" found. [Error/json/no-duplicate-keys]
 
       1 problem"
     `);
-    expect(pretty).toContain('3 |   "a": 2');
+    expect(pretty.stdout).toMatchInlineSnapshot(`
+      "1 | {
+      2 |   "a": 1, // c
+      3 |   "a": 2
+            ^
+      error: Duplicate key "a" found.  json/no-duplicate-keys
+          at x.jsonc:3:3"
+    `);
+    expect([unix.stderr, unix.exitCode, pretty.stderr, pretty.exitCode]).toEqual(["", 1, "", 1]);
   });
 
   test("--doctor counts the files and the rules as native", async () => {
     const files = { ...json, "package.json": "{}", "a.jsonc": "{}", "b.js": "" };
     const result = await lint(files, ["--doctor", "-f", "json"]);
     const { rules, ...rest } = JSON.parse(result.raw);
-    expect(rest.files.linted).toBe(4);
-    expect(JSON.stringify(rest.files)).not.toContain("json");
+    expect(rest.files).toEqual({ linted: 4, by_eslint: {}, not_linted: {} });
     expect(rules.native).toEqual(["json/no-duplicate-keys"]);
     expect(rules.javascript).toEqual({});
+    expect(result).toMatchObject({ stderr: "", exitCode: 0 });
   });
 
   test("lints a JSON block that a processor extracts", async () => {
@@ -1671,7 +1777,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       },
       ["-f", "json", "a.md"],
     );
-    expect(summary(result.raw)).toBe('a.md: 6:3 json/no-duplicate-keys Duplicate key "a" found.');
+    expect(problems(result)).toBe('a.md: 6:3 json/no-duplicate-keys Duplicate key "a" found.');
   });
 
   test("a JSON rule can't be enabled for a JavaScript file", async () => {
@@ -1684,11 +1790,13 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       "b.js": '/* eslint json/no-duplicate-keys: "error" */',
     };
     const [result, inline] = await Promise.all([lint(files, ["on/a.js"]), lint(files, ["-f", "json", "b.js"])]);
-    expect(result.stderr).toContain(
-      'Key "rules": The following rules do not support the language "js/js":\n\t- "json/no-duplicate-keys"',
-    );
-    expect(result.exitCode).toBe(2);
-    expect(summary(inline.raw)).toMatchInlineSnapshot(`
+    expect(result).toMatchObject({
+      stdout: "",
+      stderr:
+        'error: Invalid config in eslint.config.mjs\nKey "rules": The following rules do not support the language "js/js":\n\t- "json/no-duplicate-keys"',
+      exitCode: 2,
+    });
+    expect(problems(inline)).toMatchInlineSnapshot(`
       "b.js: 1:1 json/no-duplicate-keys Inline configuration for rule "json/no-duplicate-keys" is invalid:
       	Rule does not support the language "js/js". Use a config block with "files" to apply the rule only to supported files, or disable it.
       "
@@ -1731,6 +1839,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       ["-f", "unix", ...args, "a.js"],
     );
     expect(result.stdout).toMatch(/a\.js:1:1: eslint-plugin-json \[Error\/json[/(]no-duplicate-keys\)?\]/);
+    expect(result.exitCode).toBe(1);
   });
 
   // Anything that works with the package has to keep working.
@@ -1766,6 +1875,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
       const messages = JSON.parse(result.raw)[0].messages.map((it: any) => it.message);
       expect(messages.join(", ")).toBe(expected);
       expect(result.stderr).toContain("the eslint package linted 1 files");
+      expect(result.exitCode).toBe(1);
     });
 
     test("if a comment in it turns on a rule that isn't built in", async () => {
@@ -1781,6 +1891,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
           b.jsonc: 1:11 json/no-duplicate-keys Duplicate key "a" found."
         `);
       expect(result.stderr).toContain("the eslint package linted 1 files");
+      expect(result.exitCode).toBe(1);
     });
 
     // A rule that needs eslint can be turned on in the config or by a comment in the file. Either way the run goes on.
@@ -1899,9 +2010,11 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
           files[`b/${i}.md`] = markdown.text;
         }
         const result = await lint(files, ["-f", "json", "--threads", "4", "."]);
-        const linted = JSON.parse(result.raw).filter((it: any) => it.messages.length === 1);
-        expect(linted.length).toBe(21);
-        expect(result.raw).not.toContain("in-co");
+        // Each file that was linted has its one problem. The four that need eslint have no result.
+        const expected: Record<string, number> = { "eslint.config.mjs": 0, "script.js": 1 };
+        for (let i = 0; i < 10; i++) expected[`a/${i}.jsonc`] = expected[`b/${i}.md`] = 1;
+        const linted: Result[] = JSON.parse(result.raw);
+        expect(Object.fromEntries(linted.map(it => [pathOf(it), it.messages.length]))).toEqual(expected);
         expect(result.stderr).toContain(
           "4 files were not linted because they need eslint, which is not installed (3 *.jsonc, 1 *.md): a/in-comment.jsonc, a/in-comment.md, b/in-comment.jsonc, ..\n  Run bun add -d eslint",
         );
@@ -1922,12 +2035,12 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
           "b.foo": "foo\n",
         };
         const result = await lint(files, ["-f", "unix", "."]);
-        expect(result.stdout).toContain("a.js:1:1: Unexpected var");
-        expect(result.stderr).toContain(
-          "1 file was not linted because the parser in your config only works with an eslint.config.js (1 *.foo): b.foo\n",
-        );
-        expect(result.stderr).not.toContain("bun add");
-        expect(result.exitCode).toBe(2);
+        expect(result).toMatchObject({
+          stdout: "<dir>/a.js:1:1: Unexpected var, use let or const instead. [Error/no-var]\n\n1 problem",
+          stderr:
+            "Linted 1 file\nerror: 1 file was not linted because the parser in your config only works with an eslint.config.js (1 *.foo): b.foo\n  Everything else was linted. Use --allow-unsupported to make this a warning.",
+          exitCode: 2,
+        });
       });
 
       describe("a block that a processor finds in a file", () => {
@@ -1996,8 +2109,10 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
             "b.txt",
             "b.js",
           ]);
-          expect(summary(result.raw)).toStartWith("b.js: 1:1 no-var");
-          expect(result.raw).not.toContain("b.txt");
+          expect(summary(result.raw)).toBe(
+            'b.js: 1:1 no-var Unexpected var, use let or const instead. [fix 0,3 "let"]',
+          );
+          expect((JSON.parse(result.raw) as Result[]).map(pathOf)).toEqual(["b.js"]);
           expect(result.stderr).toContain(warning("b.txt"));
           expect(result.stderr).toContain("Linted 1 file\n");
           expect(result.exitCode).toBe(2);
@@ -2012,8 +2127,7 @@ describe.concurrent("bun lint with the built-in JSON languages", () => {
             "json",
             "README.md",
           ]);
-          expect(summary(result.raw)).toBe("");
-          expect(result.stderr).not.toContain("not linted");
+          expect(problems(result)).toBe("");
           expect(result.exitCode).toBe(0);
         });
       });
@@ -2119,7 +2233,8 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       endLine: 5,
       endColumn: 14,
     });
-    expect(result.stderr).not.toContain("the eslint package linted");
+    // `--timing` says what ran JavaScript: nothing did.
+    expect(result.stderr).toContain("JavaScript: 0 engines loaded 0 modules");
     expect(result.exitCode).toBe(1);
   });
 
@@ -2146,7 +2261,8 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       },
       ["-f", "json", "."],
     );
-    expect(summary(result.raw)).toMatchInlineSnapshot(`
+    const found = resultsOf(result);
+    expect(summary(found)).toMatchInlineSnapshot(`
         "block.md: 3:10 markdown/no-empty-links Unexpected empty link found.
         block.md: 7:1 markdown/no-html HTML element "b" is not allowed.
         block.md: 3:1 markdown/no-html HTML element "b" is not allowed. [suppressed: ]
@@ -2170,7 +2286,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
         unused.md: 1:1 null Unused eslint-disable directive (no problems were reported from 'markdown/no-html'). [fix 0,50 " "]
         warn.md: 3:1 markdown/no-html HTML element "b" is not allowed."
       `);
-    const severities = JSON.parse(result.raw).flatMap((it: any) => it.messages.map((it: any) => it.severity));
+    const severities = found.flatMap(it => it.messages.map(it => it.severity));
     expect(severities).toEqual([2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1]);
   });
 
@@ -2184,7 +2300,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
     const bad = "<b>a</b> https://x.y";
 
     // The `> ` or the indentation at the start of the second line isn't part of the comment.
-    test.each([
+    const containers: [string, string][] = [
       ["a block quote", within("> ", "> ", `${directive}\n${bad}`)],
       ["a block quote without the space", within(">", ">", `${directive}\n${bad}`)],
       ["a block quote with a tab", within(">\t", ">\t", `${directive}\n${bad}`)],
@@ -2198,12 +2314,21 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       ["a paragraph in a block quote", within("> ", "> ", `a ${directive} ${bad}`)],
       ["a paragraph in a block quote, with a lazy second line", `> a ${directive} ${bad}\n`],
       ["a block quote with CRLF", within("> ", "> ", `${directive}\n${bad}`).replaceAll("\n", "\r\n")],
-    ])("disables every rule it lists: %s", async (_, text) => {
-      const result = await lint({ ...project, "a.gfm.md": text }, ["-f", "json", "a.gfm.md"]);
-      const [{ messages, suppressedMessages }] = JSON.parse(result.raw);
-      expect(messages).toEqual([]);
-      expect(suppressedMessages.map((it: any) => it.ruleId)).toEqual(["markdown/no-html", "markdown/no-bare-urls"]);
+    ];
+    // One run lints the file of each row.
+    const contained = once(async () => {
+      const files = Object.fromEntries(containers.map(([, text], nth) => [`${nth}.gfm.md`, text]));
+      return resultsOf(await lint({ ...project, ...files }, ["-f", "json", ...Object.keys(files)]));
     });
+
+    test.each(containers.map(([name], nth) => [name, nth] as const))(
+      "disables every rule it lists: %s",
+      async (_, nth) => {
+        const result = (await contained()).find(it => pathOf(it) === `${nth}.gfm.md`);
+        expect(result?.messages).toEqual([]);
+        expect(result?.suppressedMessages.map(it => it.ruleId)).toEqual(["markdown/no-html", "markdown/no-bare-urls"]);
+      },
+    );
 
     test("configures a rule, and has a justification", async () => {
       const result = await lint(
@@ -2218,7 +2343,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
         },
         ["-f", "json", "."],
       );
-      expect(summary(result.raw)).toBe(
+      expect(problems(result)).toBe(
         'config.md: 3:12 markdown/no-html HTML element "i" is not allowed.\n' +
           'why.md: 3:3 markdown/no-html HTML element "b" is not allowed. [suppressed: one\ntwo]',
       );
@@ -2232,19 +2357,23 @@ describe.concurrent("bun lint with built-in Markdown", () => {
         "first.gfm.md": within("> ", "> ", `${directive}\nhttps://x.y`),
         "last.gfm.md": within("> ", "> ", `${directive}\n<b>a</b>`),
       };
-      const found = await lint({ ...project, ...files }, ["-f", "json", "."]);
-      expect(summary(found.raw).replaceAll(/^.* markdown\/.*\n?/gm, "")).toMatchInlineSnapshot(`
+      const [found, fixed] = await Promise.all([
+        lint({ ...project, ...files }, ["-f", "json", "."]),
+        lint({ ...project, ...files }, ["--fix", "."], Object.keys(files)),
+      ]);
+      expect(problems(found).replaceAll(/^.* markdown\/.*\n?/gm, "")).toMatchInlineSnapshot(`
         "all.gfm.md: 1:3 null Unused eslint-disable directive (no problems were reported from 'markdown/no-html' or 'markdown/no-bare-urls'). [fix 2,67 " "]
         first.gfm.md: 1:3 null Unused eslint-disable directive (no problems were reported from 'markdown/no-html'). [fix 22,42 ""]
         last.gfm.md: 1:3 null Unused eslint-disable directive (no problems were reported from 'markdown/no-bare-urls'). [fix 38,63 ""]
         "
       `);
-      const fixed = await lint({ ...project, ...files }, ["--fix", "."], Object.keys(files));
       expect(fixed.files).toEqual({
         "all.gfm.md": ">  \n> a\n",
         "first.gfm.md": "> <!-- eslint-disable markdown/no-bare-urls -->\n> https://x.y\n",
         "last.gfm.md": "> <!-- eslint-disable markdown/no-html -->\n> <b>a</b>\n",
       });
+      expect(fixed.stderr).toBe("Fixed 3 problems in 3 files\n✓ No problems in 4 files");
+      expect(fixed.exitCode).toBe(0);
     });
   });
 
@@ -2259,7 +2388,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       },
       ["-f", "json", "."],
     );
-    expect(summary(result.raw).replaceAll(/^.*no-html.*\n/gm, "")).toBe(
+    expect(problems(result).replaceAll(/^.*no-html.*\n/gm, "")).toBe(
       [
         "h1.md: 2:1 markdown/no-multiple-h1 Unexpected additional H1 heading found.",
         'heading.md: 5:1 markdown/no-duplicate-headings Duplicate heading "d*\r\ne" found.',
@@ -2280,13 +2409,13 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       lint(files, ["-f", "json", "--no-inline-config", "."]),
       lint(files, ["-f", "json", "--report-unused-disable-directives-severity", "error", "b.md"]),
     ]);
-    expect(summary(plain.raw)).toMatchInlineSnapshot(`
+    expect(problems(plain)).toMatchInlineSnapshot(`
         "b.md: 1:3 null Unused eslint-disable directive (no problems were reported). [fix 2,30 " "]
         no.md: 1:1 markdown/no-html HTML element "b" is not allowed.
         no.md: 1:10 null '<!-- eslint-disable-line -->' has no effect because you have 'noInlineConfig' setting in your config."
       `);
-    expect(summary(ignoring.raw)).toBe('no.md: 1:1 markdown/no-html HTML element "b" is not allowed.');
-    expect(JSON.parse(strict.raw)[0].errorCount).toBe(1);
+    expect(problems(ignoring)).toBe('no.md: 1:1 markdown/no-html HTML element "b" is not allowed.');
+    expect(resultsOf(strict)[0].errorCount).toBe(1);
   });
 
   test("languageOptions turn on front matter and math", async () => {
@@ -2318,7 +2447,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       },
       ["-f", "json", "."],
     );
-    expect(summary(result.raw)).toMatchInlineSnapshot(`
+    expect(problems(result)).toMatchInlineSnapshot(`
         "crlf.yaml.md: 5:1 markdown/no-multiple-h1 Unexpected additional H1 heading found.
         dashes.json.md: 5:1 markdown/no-multiple-h1 Unexpected additional H1 heading found.
         dashes.yaml.md: 5:1 markdown/no-multiple-h1 Unexpected additional H1 heading found.
@@ -2337,8 +2466,11 @@ describe.concurrent("bun lint with built-in Markdown", () => {
   ])("languageOptions: %s is rejected", async (options, message) => {
     const config = markdownConfig(`{ files: ["a.md"], languageOptions: ${options} }`);
     const result = await lint({ ...markdownPackage(), "eslint.config.mjs": config, "a.md": "# a\n" }, ["a.md"]);
-    expect(result.stderr).toContain(`Key "languageOptions": Invalid language option value ${message}`);
-    expect(result.exitCode).toBe(2);
+    expect(result).toMatchObject({
+      stdout: "",
+      stderr: `error: Invalid config in eslint.config.mjs\nKey "languageOptions": Invalid language option value ${message}`,
+      exitCode: 2,
+    });
   });
 
   test.each([
@@ -2348,13 +2480,16 @@ describe.concurrent("bun lint with built-in Markdown", () => {
     ],
     [
       `"markdown/fenced-code-meta": ["error", "sometimes"]`,
-      'Value "sometimes" should be equal to one of the allowed values.',
+      'Key "rules": Key "markdown/fenced-code-meta":\n\tValue "sometimes" should be equal to one of the allowed values.',
     ],
   ])("options are validated: %s", async (rule, message) => {
     const config = markdownConfig(`{ files: ["a.md"], rules: { ${rule} } }`);
     const result = await lint({ ...markdownPackage(), "eslint.config.mjs": config, "a.md": "# a\n" }, ["a.md"]);
-    expect(result.stderr).toContain(message);
-    expect(result.exitCode).toBe(2);
+    expect(result).toMatchObject({
+      stdout: "",
+      stderr: `error: Invalid config in eslint.config.mjs\n${message}`,
+      exitCode: 2,
+    });
   });
 
   // The plugin compiles these options in `create()`, so `new RegExp` throws there and ESLint stops.
@@ -2372,14 +2507,17 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       "comment.md": `# a\n\n<!-- eslint markdown/${rule}: ["error", { ${option}: "[" }] -->\n`,
     };
     const [config, comment] = await Promise.all([lint(files, ["config.md"]), lint(files, ["comment.md"])]);
-    const loading = `SyntaxError: Error while loading rule 'markdown/${rule}': Invalid regular expression:`;
-    expect(config.stderr).toContain(
-      `${loading} /(/${flags}: Unterminated group\nOccurred while linting <dir>/config.md`,
-    );
-    expect(comment.stderr).toContain(
-      `${loading} /[/${flags}: Unterminated character class\nOccurred while linting <dir>/comment.md`,
-    );
-    expect([config.exitCode, comment.exitCode]).toEqual([2, 2]);
+    const loading = `error: SyntaxError: Error while loading rule 'markdown/${rule}': Invalid regular expression:`;
+    expect(config).toMatchObject({
+      stdout: "",
+      stderr: `${loading} /(/${flags}: Unterminated group\nOccurred while linting <dir>/config.md`,
+      exitCode: 2,
+    });
+    expect(comment).toMatchObject({
+      stdout: "",
+      stderr: `${loading} /[/${flags}: Unterminated character class\nOccurred while linting <dir>/comment.md`,
+      exitCode: 2,
+    });
   });
 
   test("--fix, after a byte order mark and with CRLF", async () => {
@@ -2388,44 +2526,44 @@ describe.concurrent("bun lint with built-in Markdown", () => {
     expect(result.files).toEqual({
       "a.gfm.md": `${mark}# Ünï 😀\r\n\r\n**a** and [b](c) and <https://example.com> and [d][e]\r\n\r\n[e]: f\r\n`,
     });
+    expect(result.stderr).toBe("Fixed 5 problems in 1 file\n✓ No problems in 2 files");
     expect(result.exitCode).toBe(0);
   });
 
   test("--stdin, and the formats", async () => {
-    using dir = tempDir("bun-lint-js-parsers", project);
-    const run = async (format: string) => {
-      await using proc = spawn({
-        cmd: [bunExe(), "lint", "--stdin", "--stdin-filename", "x.gfm.md", "-f", format],
-        env,
-        cwd: String(dir),
-        stdin: Buffer.from("# a\n\n| a |\n| - |\n| 1 | é |\n"),
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-      const [stdout, exitCode] = await Promise.all([proc.stdout.text(), proc.exited]);
-      expect(exitCode).toBe(1);
-      return normalizeBunSnapshot(stdout, String(dir));
-    };
+    const text = "# a\n\n| a |\n| - |\n| 1 | é |\n";
+    const run = (format: string) => lint(project, ["--stdin", "--stdin-filename", "x.gfm.md", "-f", format], [], text);
     const [stylish, unix, pretty] = await Promise.all([run("stylish"), run("unix"), run("pretty")]);
-    expect(stylish).toMatchInlineSnapshot(`
+    expect(stylish.stdout).toMatchInlineSnapshot(`
         "<dir>/x.gfm.md
           5:5  error  Table column count mismatch (Expected: 1, Actual: 2), extra data starting here will be ignored  markdown/table-column-count
 
         ✖ 1 problem (1 error, 0 warnings)"
       `);
-    expect(unix).toContain(
-      "x.gfm.md:5:5: Table column count mismatch (Expected: 1, Actual: 2), extra data starting here will be ignored. [Error/markdown/table-column-count]",
-    );
-    expect(pretty).toContain("5 | | 1 | é |");
+    expect(unix.stdout).toMatchInlineSnapshot(`
+      "<dir>/x.gfm.md:5:5: Table column count mismatch (Expected: 1, Actual: 2), extra data starting here will be ignored. [Error/markdown/table-column-count]
+
+      1 problem"
+    `);
+    expect(pretty.stdout).toMatchInlineSnapshot(`
+      "3 | | a |
+      4 | | - |
+      5 | | 1 | é |
+              ^
+      error: Table column count mismatch (Expected: 1, Actual: 2), extra data starting here will be ignored.  markdown/table-column-count
+          at x.gfm.md:5:5"
+    `);
+    for (const run of [stylish, unix, pretty]) expect(run).toMatchObject({ stderr: "", exitCode: 1 });
   });
 
   test("--doctor counts the files and the rules as native", async () => {
     const files = { ...few, "package.json": "{}", "a.md": "# a\n", "b.js": "" };
     const result = await lint(files, ["--doctor", "-f", "json"]);
     const { rules, ...rest } = JSON.parse(result.raw);
-    expect(JSON.stringify(rest.files)).not.toContain(".md");
+    expect(rest.files).toEqual({ linted: 3, by_eslint: {}, not_linted: {} });
     expect(rules.native).toEqual(["markdown/no-empty-links", "markdown/no-html"]);
     expect(rules.javascript).toEqual({});
+    expect(result).toMatchObject({ stderr: "", exitCode: 0 });
   });
 
   // The plugin's rules don't declare `meta.languages`, so ESLint allows it.
@@ -2438,7 +2576,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       "a.js": 'debugger; /* eslint markdown/no-empty-links: "error" */\n',
     };
     const result = await lint(files, ["-f", "json", "a.js"]);
-    expect(summary(result.raw)).toBe("a.js: 1:1 no-debugger Unexpected 'debugger' statement.");
+    expect(problems(result)).toBe("a.js: 1:1 no-debugger Unexpected 'debugger' statement.");
     expect(result.exitCode).toBe(1);
   });
 
@@ -2459,7 +2597,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       "a.md": "# a\n\n### b\n\n```js\ndebugger;\n```\n",
     };
     const result = await lint(files, ["-f", "json", "a.md"]);
-    expect(summary(result.raw)).toBe("a.md: 6:1 no-debugger Unexpected 'debugger' statement.");
+    expect(problems(result)).toBe("a.md: 6:1 no-debugger Unexpected 'debugger' statement.");
   });
 
   // micromark 4.0.3, the plugin's parser, parses each of these differently.
@@ -2477,7 +2615,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       },
       ["-f", "json", "."],
     );
-    expect(summary(result.raw)).toMatchInlineSnapshot(`
+    expect(problems(result)).toMatchInlineSnapshot(`
         "paren-in-title.md: 1:2 markdown/no-missing-label-refs Label reference 'a' not found.
         slash-in-value.md: 1:3 markdown/no-html HTML element "a" is not allowed."
       `);
@@ -2533,7 +2671,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
   test("lints a file that crashes the plugin", async () => {
     const files = { ...project, "a.gfm.md": "# a\n\n[www.example.com\n\n<www.example.com> <b>c</b>\n" };
     const result = await lint(files, ["-f", "json", "."]);
-    expect(summary(result.raw)).toBe('a.gfm.md: 5:19 markdown/no-html HTML element "b" is not allowed.');
+    expect(problems(result)).toBe('a.gfm.md: 5:19 markdown/no-html HTML element "b" is not allowed.');
   });
 
   test("the run ends the same way as in ESLint when one of the plugin's rules throws", async () => {
@@ -2541,11 +2679,12 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       `{ rules: { "markdown/no-missing-atx-heading-space": ["error", { checkClosedHeadings: true }] } }`,
     );
     const result = await lint({ ...markdownPackage(), "eslint.config.mjs": config, "a.md": "#\n" }, ["a.md"]);
-    expect(result.stderr).toContain(
-      "RangeError: Index out of range (requested index -1, but source text has length 2).",
-    );
-    expect(result.stderr).toContain('Rule: "markdown/no-missing-atx-heading-space"');
-    expect(result.exitCode).toBe(2);
+    expect(result).toMatchObject({
+      stdout: "",
+      stderr:
+        'error: RangeError: Index out of range (requested index -1, but source text has length 2).\nOccurred while linting <dir>/a.md:1\nRule: "markdown/no-missing-atx-heading-space"',
+      exitCode: 2,
+    });
   });
 
   test("invalid UTF-8 and NUL in a file count as U+FFFD", async () => {
@@ -2559,7 +2698,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       ["-f", "json", "."],
     );
     const replaced = String.fromCodePoint(0xfffd);
-    expect(summary(result.raw)).toBe(
+    expect(problems(result)).toBe(
       [
         "a.md: 3:1 markdown/no-multiple-h1 Unexpected additional H1 heading found.",
         `a.md: 3:1 markdown/no-duplicate-headings Duplicate heading "a${replaced}" found.`,
@@ -2568,31 +2707,6 @@ describe.concurrent("bun lint with built-in Markdown", () => {
         'nul.md: 7:1 markdown/no-html HTML element "i" is not allowed.',
       ].join("\n"),
     );
-  });
-
-  describe("runs in linear time", () => {
-    const count = many(20_000);
-    test.each([
-      ["headings", "# a\n\n"],
-      ["HTML headings", "<h1>a</h1>"],
-      ["opening heading tags", "<h1>"],
-      ["tags with an id", "<div id=a>\n"],
-      ["references on one line, after a non-ASCII character", "é [a] "],
-      ["definitions", "[a]: b\n"],
-      ["fragment links", "[a](#b) "],
-      ["emphasis markers", "* a *"],
-      ["comments", "<!-- a -->"],
-      ["unclosed comments", "<!-- "],
-      ["bare URLs", "https://a.b "],
-      ["rows", "| a | b |\n"],
-      ["block quotes", "> "],
-      ["list items", "- "],
-    ])("%s", async (_, unit) => {
-      const text = `| a |\n| - |\n${repeated(unit, count)}\n`;
-      const result = await lint({ ...project, "a.gfm.md": text }, ["-f", "json", "a.gfm.md"]);
-      expect(JSON.parse(result.raw)[0].messages.filter((it: any) => it.fatal)).toEqual([]);
-      expect(result.exitCode).toBeLessThan(2);
-    });
   });
 
   // Anything that works with the package has to keep working.
@@ -2635,6 +2749,7 @@ describe.concurrent("bun lint with built-in Markdown", () => {
       const messages = JSON.parse(result.raw)[0].messages.map((it: any) => it.message);
       expect(messages.join(", ")).toBe(expected);
       expect(result.stderr).toContain("the eslint package linted 1 files");
+      expect(result.exitCode).toBe(1);
     });
 
     test("if a comment in it turns on a rule that isn't built in", async () => {
@@ -2651,6 +2766,39 @@ describe.concurrent("bun lint with built-in Markdown", () => {
           b.md: 1:1 markdown/no-html HTML element "b" is not allowed."
         `);
       expect(result.stderr).toContain("the eslint package linted 1 files");
+      expect(result.exitCode).toBe(1);
+    });
+  });
+
+  // Below the tests that start a JavaScript engine. With LeakSanitizer such a run ends seconds after any other, and an ASAN
+  // build runs 5 tests at a time: these run while the last of those still wait.
+  describe("runs in linear time", () => {
+    const count = many(20_000);
+    // What is repeated, and how often each rule reports it.
+    test.each<[string, string, Record<string, number>]>([
+      ["headings", "# a\n\n", { "no-multiple-h1": count - 1, "no-duplicate-headings": count - 1 }],
+      ["HTML headings", "<h1>a</h1>", { "no-html": count, "no-multiple-h1": count - 1 }],
+      ["opening heading tags", "<h1>", { "no-html": count }],
+      ["tags with an id", "<div id=a>\n", { "no-html": count }],
+      ["references on one line, after a non-ASCII character", "é [a] ", { "no-missing-label-refs": count }],
+      ["definitions", "[a]: b\n", { "no-missing-label-refs": count }],
+      ["fragment links", "[a](#b) ", { "no-missing-link-fragments": count }],
+      ["emphasis markers", "* a *", { "no-space-in-emphasis": count - 2 }],
+      ["comments", "<!-- a -->", {}],
+      ["unclosed comments", "<!-- ", {}],
+      ["bare URLs", "https://a.b ", { "no-bare-urls": count }],
+      ["rows", "| a | b |\n", { "table-column-count": count }],
+      ["block quotes", "> ", {}],
+      ["list items", "- ", {}],
+    ])("%s", async (_, unit, expected) => {
+      const text = `| a |\n| - |\n${repeated(unit, count)}\n`;
+      const [{ messages }] = resultsOf(await lint({ ...project, "a.gfm.md": text }, ["-f", "json", "a.gfm.md"]));
+      const found: Record<string, number> = {};
+      for (const { ruleId } of messages) {
+        const rule = String(ruleId).replace("markdown/", "");
+        found[rule] = (found[rule] ?? 0) + 1;
+      }
+      expect(found).toEqual(expected);
     });
   });
 });
@@ -2754,6 +2902,7 @@ describe.concurrent("bun lint with an .oxlintrc.json", () => {
       c.astro 6:9 eslint(no-var)"
     `);
     expect(JSON.parse(result.raw).number_of_files).toBe(4);
+    expect(result.stderr).toBe("");
     expect(result.exitCode).toBe(1);
   });
 
@@ -2824,6 +2973,7 @@ describe.concurrent("bun lint with an .oxlintrc.json", () => {
       ,
       }
     `);
+    expect(result.stderr).toBe("Fixed 7 problems in 3 files");
     expect(result.exitCode).toBe(1);
   });
 });
