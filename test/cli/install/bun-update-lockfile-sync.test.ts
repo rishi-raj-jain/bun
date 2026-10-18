@@ -1772,8 +1772,9 @@ describe.concurrent("bun update --latest keeps a dependency on the package of th
       await run(dir, ...LATEST);
       expect(await lockText(dir)).toBe(lockBefore);
 
+      // The keys of a file tree have "/" on every platform.
       const files = await Promise.all(
-        members.map(async key => [join(key, "package.json"), await pkgText(dir, key)] as const),
+        members.map(async key => [key ? `${key}/package.json` : "package.json", await pkgText(dir, key)] as const),
       );
       const clone = await setup({ ...Object.fromEntries(files), "bun.lock": lockBefore }, { registry, install: false });
       await install(clone, { frozen: true });

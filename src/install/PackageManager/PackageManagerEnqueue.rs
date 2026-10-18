@@ -2969,8 +2969,7 @@ fn links_workspace(
     .is_some()
 }
 
-/// The root's row for the workspace `name_hash`, and the package that the row is bound to. A row
-/// that is bound wins over one that is not.
+/// The root's row for the workspace `name_hash`, with its package. A bound row comes first.
 fn root_workspace_row(
     lockfile: &Lockfile::Lockfile,
     name_hash: PackageNameHash,
@@ -3010,8 +3009,7 @@ fn root_workspace_package_id(
     }
 }
 
-/// The differ leaves the root's row for a workspace unbound until its turn in a bare update, and
-/// for a workspace that package.json just gained. A row that links the workspace can come first.
+/// Binds the root's row for a workspace before its turn: a row that links the workspace came first.
 #[cold]
 #[inline(never)]
 fn bind_root_workspace_row(
