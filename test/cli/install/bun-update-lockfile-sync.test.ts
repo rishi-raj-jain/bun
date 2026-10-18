@@ -1620,7 +1620,7 @@ describe.concurrent("bun update --latest keeps a dependency on the package of th
     },
   );
 
-  describe("a catalog range", () => {
+  describe("a catalog entry", () => {
     const entries = (name = "no-deps", range = "^0.1.0") => ({ [name]: range, "a-dep": "^1.0.1" });
     const references = (name = "no-deps", reference = "catalog:") => ({ [name]: reference, "a-dep": reference });
     type Row = {
@@ -1713,6 +1713,22 @@ describe.concurrent("bun update --latest keeps a dependency on the package of th
       expect(await pkgText(dir)).toBe(rootBefore);
       expect(await lockText(dir)).toBe(lockBefore);
       await expectLinked(dir, registry, "no-deps", "1.0.0");
+    });
+
+    // A dist-tag asks the registry first. The workspace package stands in for a name that the registry does not have.
+    test("on a dist-tag keeps the workspace package for a name that the registry does not have", async () => {
+      const name = "only-mine";
+      using registry = recording();
+      const dir = await project(
+        registry,
+        cataloged({ title: "", name, root: { workspaces: { packages: PACKAGES, catalog: entries(name, "latest") } } }),
+      );
+      const rootBefore = await pkgText(dir);
+      expect((await run(dir, ...LATEST)).stderr).toBe(SAVED);
+      expect(await pkgText(dir)).toBe(rootBefore.replace('"a-dep": "^1.0.1"', '"a-dep": "^1.0.10"'));
+      expect(await resolutions(dir, name)).toStrictEqual([`${name}@workspace:packages/${name}`]);
+      expect(await loaded(dir, name)).toEqual(own(name, "0.1.0"));
+      await expectInSync(dir, ["", APP]);
     });
 
     // Nothing links the workspace package of that name to these entries, so they are registry entries.
