@@ -1698,7 +1698,9 @@ fn yaml_merge_key_expr_eql(l: &Expr, r: &Expr) -> bool {
     match (&l.data, &r.data) {
         (ast::ExprData::ENull(_), _) => true,
         (ast::ExprData::EBoolean(lb), ast::ExprData::EBoolean(rb)) => lb.value == rb.value,
-        (ast::ExprData::ENumber(ln), ast::ExprData::ENumber(rn)) => ln.value() == rn.value(),
+        (ast::ExprData::ENumber(ln), ast::ExprData::ENumber(rn)) => {
+            yaml_merge_key_number_bits(ln.value()) == yaml_merge_key_number_bits(rn.value())
+        }
         (ast::ExprData::EString(ls), ast::ExprData::EString(rs)) => {
             // UTF-8/UTF-16-aware string equality.
             if ls.is_utf16 != rs.is_utf16 {
@@ -1725,15 +1727,19 @@ fn yaml_merge_key_expr_hash(key: &Expr) -> u64 {
     match &key.data {
         ast::ExprData::ENull(_) => 0,
         ast::ExprData::EBoolean(b) => 1 + b.value as u64,
-        ast::ExprData::ENumber(n) => {
-            let value = if n.value() == 0.0 { 0.0 } else { n.value() };
-            value.to_bits()
-        }
+        ast::ExprData::ENumber(n) => yaml_merge_key_number_bits(n.value()),
         ast::ExprData::EString(s) => s.hash(),
         ast::ExprData::EArray(a) => a.as_ptr() as usize as u64,
         ast::ExprData::EObject(o) => o.as_ptr() as usize as u64,
         _ => u64::MAX,
     }
+}
+
+/// A number key as the two functions above see it. `0.0` and `-0.0` are one key. NaN is one
+/// key too: the scanner makes every NaN from `f64::NAN`.
+fn yaml_merge_key_number_bits(value: f64) -> u64 {
+    let value = if value == 0.0 { 0.0 } else { value };
+    value.to_bits()
 }
 
 pub struct Stream<'i, Enc: Encoding> {
