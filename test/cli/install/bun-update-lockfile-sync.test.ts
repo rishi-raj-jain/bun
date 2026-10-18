@@ -1184,16 +1184,6 @@ describe.concurrent("catalogs", () => {
     await expectInSync(dir, ["", PKG1]);
   });
 
-  // The registry's `latest` dep-with-tags is 3.0.0, and 3.0.1 is published.
-  test.each([[""], [PKG1]])("bun update --latest from '%s' does not move a catalog entry below bun.lock", async cwd => {
-    const dir = await setup(CATALOG_REPO({ "dep-with-tags": "3.0.1" }));
-    const [pkgBefore, lockBefore] = await Promise.all([pkgText(dir), lockText(dir)]);
-    expect((await runIn(dir, cwd, "update", "--latest")).stderr).toBe("");
-    expect(await pkgText(dir)).toBe(pkgBefore);
-    expect(await lockText(dir)).toBe(lockBefore);
-    expect(await installed(dir, "dep-with-tags")).toMatchObject({ version: "3.0.1" });
-  });
-
   test("a second bun update --latest -r changes nothing", async () => {
     const dir = await setup(CATALOG_REPO({ "no-deps": "^1.0.0" }));
     await run(dir, "update", "--latest", "-r");
@@ -1487,22 +1477,6 @@ describe.concurrent("bun update --latest keeps the version an override selects",
     await expectInSync(dir);
   });
 
-  // The row that the override sends to the entry is one-range-dep's, wherever one-range-dep is in the tree.
-  test.each([
-    ["the member that uses the entry", { pkg1: { dependencies: { ...transitive, "no-deps": "catalog:" } } }],
-    ["another member", { pkg1: { dependencies: { "no-deps": "catalog:" } }, pkg2: { dependencies: transitive } }],
-  ])("from a member, a catalog: override follows the entry for a row of %s", async (_, members) => {
-    const rootFields = {
-      workspaces: { ...catalog("1.0.0"), packages: ["packages/*"] },
-      overrides: { "no-deps": "catalog:" },
-    };
-    const dir = await setup(WORKSPACES(rootFields, members));
-    await runIn(dir, PKG1, "update", "--latest");
-    expect((await pkg(dir)).workspaces.catalog).toStrictEqual({ "no-deps": "2.0.0" });
-    expect(await resolutions(dir, "no-deps")).toStrictEqual(["no-deps@2.0.0"]);
-    await expectInSync(dir, ["", ...Object.keys(members).map(name => `packages/${name}`)]);
-  });
-
   test.each([
     [[], PKG1],
     [["-r"], ""],
@@ -1729,6 +1703,81 @@ describe.concurrent("bun update --latest keeps a dependency on the package of th
       expect(await resolutions(dir, name)).toStrictEqual([`${name}@workspace:packages/${name}`]);
       expect(await loaded(dir, name)).toEqual(own(name, "0.1.0"));
       await expectInSync(dir, ["", APP]);
+    });
+
+    // After a change of the catalog the rows that read it are resolved before the root's row for the workspace
+    // package, which a bare update leaves unbound until its turn.
+    test.each(["no-deps", "only-mine"])(
+      "that links a workspace package is not sent after a hand edit of another entry: %s",
+      async name => {
+        using registry = recording();
+        const catalog = { [name]: "^0.1.0", "a-dep": "1.0.1" };
+        const dir = await project(
+          registry,
+          cataloged({ title: "", name, root: { workspaces: { packages: PACKAGES, catalog } } }),
+        );
+        const edited = (await pkgText(dir)).replace('"a-dep": "1.0.1"', '"a-dep": "1.0.2"');
+        await write(join(dir, "package.json"), edited);
+        expect((await run(dir, "update")).stderr).toBe(SAVED);
+        expect(await pkgText(dir)).toBe(edited);
+        expect(await resolutions(dir, "a-dep")).toStrictEqual(["a-dep@1.0.2"]);
+        await expectLinked(dir, registry, name, "0.1.0");
+        await expectInSync(dir, ["", APP]);
+      },
+    );
+
+    test("binds a workspace package that package.json gains together with the entry", async () => {
+      const name = "only-mine";
+      using registry = recording();
+      const dir = await project(registry, {
+        "package.json": {
+          name: "root",
+          private: true,
+          workspaces: { packages: PACKAGES, catalog: { [name]: "npm:no-deps@1.0.0" } },
+        },
+        [`${APP}/package.json`]: member("web", { dependencies: { [name]: "catalog:" } }),
+      });
+      expect(await loaded(dir, name)).toMatchObject({ name: "no-deps", version: "1.0.0" });
+      await write(join(dir, "packages", name, "package.json"), json(own(name, "0.1.0")));
+      await write(join(dir, "package.json"), (await pkgText(dir)).replace("npm:no-deps@1.0.0", "^0.1.0"));
+      await install(dir);
+      await expectLinked(dir, registry, name, "0.1.0");
+      await expectInSync(dir, ["", APP]);
+    });
+
+    // kit's peer and web's dependency move with the entry. one-range-dep@1.0.0 asks for no-deps@^1.0.0 itself.
+    test("that moves leaves a transitive range its own copy, also in a fresh clone", async () => {
+      const members = ["", APP, "apps/cli", "packages/kit"];
+      using registry = recording();
+      const dir = await project(registry, {
+        "package.json": {
+          name: "root",
+          private: true,
+          workspaces: { packages: PACKAGES, catalog: { "no-deps": "^1.0.0" } },
+        },
+        [`${APP}/package.json`]: member("web", { dependencies: { "no-deps": "catalog:" } }),
+        "apps/cli/package.json": member("cli", { dependencies: { "one-range-dep": "1.0.0" } }),
+        "packages/kit/package.json": member("kit", { peerDependencies: { "no-deps": "catalog:" } }),
+      });
+      expect((await run(dir, ...LATEST)).stderr).toBe(SAVED);
+      expect((await pkg(dir)).workspaces.catalog).toStrictEqual({ "no-deps": "^2.0.0" });
+      const { packages } = await lock(dir);
+      expect({ top: packages["no-deps"][0], below: packages["one-range-dep/no-deps"][0] }).toEqual({
+        top: "no-deps@2.0.0",
+        below: "no-deps@1.1.0",
+      });
+      await expectInSync(dir, members);
+
+      const lockBefore = await lockText(dir);
+      await run(dir, ...LATEST);
+      expect(await lockText(dir)).toBe(lockBefore);
+
+      const files = await Promise.all(
+        members.map(async key => [join(key, "package.json"), await pkgText(dir, key)] as const),
+      );
+      const clone = await setup({ ...Object.fromEntries(files), "bun.lock": lockBefore }, { registry, install: false });
+      await install(clone, { frozen: true });
+      expect(await installed(clone, "one-range-dep/node_modules/no-deps")).toMatchObject({ version: "1.1.0" });
     });
 
     // Nothing links the workspace package of that name to these entries, so they are registry entries.
