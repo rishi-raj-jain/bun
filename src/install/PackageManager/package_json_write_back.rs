@@ -569,18 +569,6 @@ fn sync_lockfile(
             links |= manager.lockfile.bind_workspace_link(row.off + ti as u32);
         }
     }
-    // `steer_used_catalogs_to_latest` ran, also when the root is not edited.
-    if manager.options.do_.contains(Do::UPDATE_TO_LATEST)
-        && scratch.catalogs.has_any()
-        && edited.iter().all(|e| e.target.name_hash.is_some())
-    {
-        let known = &mut manager.known_npm_aliases;
-        let (mut builder, lf) = manager.lockfile.string_builder_split();
-        scratch.catalogs.count(sbuf, &mut builder);
-        builder.allocate()?;
-        *lf.catalogs = scratch.catalogs.clone(known, sbuf, &mut builder)?;
-        builder.clamp();
-    }
     // A `$name` of the root can name a literal that only a member declares.
     if overrides_changed && edited.iter().all(|e| e.target.name_hash.is_some()) {
         let known = &mut manager.known_npm_aliases;

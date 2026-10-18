@@ -1202,7 +1202,7 @@ fn request_row_ahead(this: &mut PackageManager, id: DependencyID, item: Lockfile
         asked.name_hash,
         asked.name,
         asked.version,
-        asked.version_was_replaced,
+        asked.replaced,
     );
     let resolution = this.lockfile.buffers.resolutions[id as usize];
     let settled = settle_without_manifest(
@@ -1210,7 +1210,7 @@ fn request_row_ahead(this: &mut PackageManager, id: DependencyID, item: Lockfile
         asked.name_hash,
         &dependency,
         asked.version,
-        asked.version_was_replaced,
+        asked.replaced.any(),
         id,
         resolution,
         install_peer,
@@ -1652,8 +1652,25 @@ struct Asked<'a> {
     name: SemverString,
     name_hash: PackageNameHash,
     version: &'a dependency::Version,
-    /// One of those three replaced the version that the dependency declares.
-    version_was_replaced: bool,
+    replaced: Replaced,
+}
+
+/// Whether an `npm:` alias of the project, an override or a catalog replaced the version that the
+/// dependency declares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replaced {
+    No,
+    Yes,
+    /// By the catalog entry that the dependency's own `catalog:` names, under a `bun update
+    /// --latest` that moves the catalog: the row resolves `latest` and the entry follows it.
+    ByMovedCatalogEntry,
+}
+
+impl Replaced {
+    #[inline]
+    fn any(self) -> bool {
+        self != Replaced::No
+    }
 }
 
 /// `replacement` is where the caller keeps the version if one of the three replaces the declared
@@ -1680,6 +1697,7 @@ fn asked_version<'a>(
         _ => dependency.name_hash,
     };
 
+    let mut moved_catalog_entry = false;
     'replaced: {
         // Only a plain dependency follows a same-named `npm:` alias of the project.
         if dependency.version.tag == dependency::version::Tag::Npm
@@ -1760,6 +1778,10 @@ fn asked_version<'a>(
                         .catalogs
                         .get(&this.lockfile, *declared.catalog(), name)
                 {
+                    // An entry that only an override sends rows to stays a pin.
+                    moved_catalog_entry =
+                        package_manager_real::PackageJSONEditor::steers_catalogs_to_latest(this)
+                            && names_same_catalog(this, &dependency.version, declared);
                     let v = catalog_dep.version;
                     (name, name_hash) = update_name_and_name_hash_from_version_replacement(
                         &this.lockfile,
@@ -1782,8 +1804,25 @@ fn asked_version<'a>(
         name,
         name_hash,
         version: replacement.as_ref().unwrap_or(&dependency.version),
-        version_was_replaced: replacement.is_some(),
+        replaced: match replacement {
+            None => Replaced::No,
+            Some(_) if moved_catalog_entry => Replaced::ByMovedCatalogEntry,
+            Some(_) => Replaced::Yes,
+        },
     })
+}
+
+/// Whether the dependency's own `catalog:` names the catalog that `declared` names.
+#[cold]
+#[inline(never)]
+fn names_same_catalog(
+    this: &PackageManager,
+    own: &dependency::Version,
+    declared: &dependency::Version,
+) -> bool {
+    let buf = this.lockfile.buffers.string_bytes.as_slice();
+    own.tag == dependency::version::Tag::Catalog
+        && Lockfile::CatalogMap::same_name(own.catalog().slice(buf), declared.catalog().slice(buf))
 }
 
 /// The alias (a future folder) or the registry name of a dependency, if it is unsafe. Such a
@@ -1860,7 +1899,7 @@ pub(crate) fn bind_row(
         name,
         name_hash,
         version,
-        version_was_replaced,
+        replaced,
     } = asked;
     let mut loaded_manifest: Option<Npm::PackageManifest> = None;
 
@@ -1875,7 +1914,7 @@ pub(crate) fn bind_row(
                     name,
                     dependency,
                     version,
-                    version_was_replaced,
+                    replaced,
                     dependency.behavior,
                     id,
                     resolution,
@@ -1970,13 +2009,7 @@ pub(crate) fn bind_row(
                                     || manifest.pkg.has_extended_manifest
                                     || manifest.should_exclude_from_age_filter(excludes))
                                 && !picks_latest_tag(
-                                    this,
-                                    dependency,
-                                    id,
-                                    name_hash,
-                                    name,
-                                    version,
-                                    version_was_replaced,
+                                    this, dependency, id, name_hash, name, version, replaced,
                                 )
                                 && let Some(find_result) = manifest.find_by_version(exact)
                                 && manifest.is_in_bounds(find_result.package)
@@ -2100,7 +2133,7 @@ fn bind_row_without_manifest(
         name,
         name_hash,
         version,
-        version_was_replaced,
+        replaced,
     } = asked;
     let waiter = || {
         if is_root {
@@ -2250,7 +2283,7 @@ fn bind_row_without_manifest(
                 name,
                 dependency,
                 version,
-                version_was_replaced,
+                replaced,
                 dependency.behavior,
                 id,
                 resolution,
@@ -2317,7 +2350,7 @@ fn bind_row_without_manifest(
             });
             // Only a package.json read from the project may name a tarball in the project.
             if res.tag == ResolutionTag::LocalTarball
-                && !version_was_replaced
+                && !replaced.any()
                 && !this.lockfile.is_dependency_of_local_package(id)
                 && !this.lockfile.has_equal_root_dependency(dependency)
                 && let Some(declarer) = this.lockfile.get_parent_pkg_of_dependency(id)
@@ -3419,13 +3452,14 @@ fn get_or_put_resolved_package(
     name: SemverString,
     dependency: &Dependency,
     version: &dependency::Version,
-    version_was_replaced: bool,
+    replaced: Replaced,
     behavior: Behavior,
     dependency_id: DependencyID,
     resolution: PackageID,
     install_peer: bool,
     success_fn: SuccessFn,
 ) -> crate::Result<Option<ResolvedPackageResult>> {
+    let version_was_replaced = replaced.any();
     let latest_for_target = picks_latest_tag(
         this,
         dependency,
@@ -3433,7 +3467,7 @@ fn get_or_put_resolved_package(
         name_hash,
         name,
         version,
-        version_was_replaced,
+        replaced,
     );
     match settle_without_manifest(
         this,
@@ -3853,7 +3887,8 @@ fn names_update_request(
         || (name_hash != dependency.name_hash && this.is_update_request(name_hash, name.slice(buf)))
 }
 
-/// The row keeps its declared specifier; one an override or a catalog replaced is not moved here.
+/// The row keeps its declared specifier, and so does a catalog entry: the workspace link and the
+/// version in bun.lock are read from what package.json says. One an override replaced is not moved.
 fn picks_latest_tag(
     this: &mut PackageManager,
     dependency: &Dependency,
@@ -3861,17 +3896,20 @@ fn picks_latest_tag(
     name_hash: PackageNameHash,
     name: SemverString,
     version: &dependency::Version,
-    version_was_replaced: bool,
+    replaced: Replaced,
 ) -> bool {
     if !this.to_update
-        || version_was_replaced
+        || replaced == Replaced::Yes
         || !this.options.do_.contains(Do::UPDATE_TO_LATEST)
         || !version.tag.is_npm()
     {
         return false;
     }
-    (this.update_requests.is_empty() || names_update_request(this, dependency, name_hash, name))
-        && update_target_declares(this, dependency_id)
+    // Catalogs are the root's: each `catalog:` row moves with its entry, in every workspace.
+    replaced == Replaced::ByMovedCatalogEntry
+        || ((this.update_requests.is_empty()
+            || names_update_request(this, dependency, name_hash, name))
+            && update_target_declares(this, dependency_id))
 }
 
 /// The targets: the `-r` / `--filter` selection, else the workspace the command runs in.

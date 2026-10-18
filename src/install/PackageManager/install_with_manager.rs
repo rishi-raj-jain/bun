@@ -206,9 +206,6 @@ pub fn install_with_manager(
                         Features::main(),
                     )?;
                 }
-                if PackageJSONEditor::steers_catalogs_to_latest(manager) {
-                    PackageJSONEditor::steer_used_catalogs_to_latest(manager, Some(&mut lockfile))?;
-                }
                 let mut mapping = vec![invalid_package_id; maybe_root.dependencies.len as usize];
 
                 // `Diff::generate` (in lockfile_real::package) needs `manager`,
@@ -2174,9 +2171,6 @@ fn create_new_lockfile_and_enqueue(
             &mut resolver,
             Features::main(),
         )?;
-    }
-    if PackageJSONEditor::steers_catalogs_to_latest(manager) {
-        PackageJSONEditor::steer_used_catalogs_to_latest(manager, None)?;
     }
 
     root = manager.lockfile.append_package(&root)?;
