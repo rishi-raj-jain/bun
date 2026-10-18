@@ -1487,6 +1487,22 @@ describe.concurrent("bun update --latest keeps the version an override selects",
     await expectInSync(dir);
   });
 
+  // The row that the override sends to the entry is one-range-dep's, wherever one-range-dep is in the tree.
+  test.each([
+    ["the member that uses the entry", { pkg1: { dependencies: { ...transitive, "no-deps": "catalog:" } } }],
+    ["another member", { pkg1: { dependencies: { "no-deps": "catalog:" } }, pkg2: { dependencies: transitive } }],
+  ])("from a member, a catalog: override follows the entry for a row of %s", async (_, members) => {
+    const rootFields = {
+      workspaces: { ...catalog("1.0.0"), packages: ["packages/*"] },
+      overrides: { "no-deps": "catalog:" },
+    };
+    const dir = await setup(WORKSPACES(rootFields, members));
+    await runIn(dir, PKG1, "update", "--latest");
+    expect((await pkg(dir)).workspaces.catalog).toStrictEqual({ "no-deps": "2.0.0" });
+    expect(await resolutions(dir, "no-deps")).toStrictEqual(["no-deps@2.0.0"]);
+    await expectInSync(dir, ["", ...Object.keys(members).map(name => `packages/${name}`)]);
+  });
+
   test.each([
     [[], PKG1],
     [["-r"], ""],
