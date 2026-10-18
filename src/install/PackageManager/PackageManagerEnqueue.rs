@@ -1202,7 +1202,7 @@ fn request_row_ahead(this: &mut PackageManager, id: DependencyID, item: Lockfile
         asked.name_hash,
         asked.name,
         asked.version,
-        asked.replaced,
+        asked.version_was_replaced,
     );
     let resolution = this.lockfile.buffers.resolutions[id as usize];
     let settled = settle_without_manifest(
@@ -1210,7 +1210,7 @@ fn request_row_ahead(this: &mut PackageManager, id: DependencyID, item: Lockfile
         asked.name_hash,
         &dependency,
         asked.version,
-        asked.replaced.any(),
+        asked.version_was_replaced,
         id,
         resolution,
         install_peer,
@@ -1652,25 +1652,8 @@ struct Asked<'a> {
     name: SemverString,
     name_hash: PackageNameHash,
     version: &'a dependency::Version,
-    replaced: Replaced,
-}
-
-/// Whether an `npm:` alias of the project, an override or a catalog replaced the version that the
-/// dependency declares.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Replaced {
-    No,
-    Yes,
-    /// By the catalog entry that the dependency's own `catalog:` names, under a `bun update
-    /// --latest` that moves the catalog: the row resolves `latest` and the entry follows it.
-    ByMovedCatalogEntry,
-}
-
-impl Replaced {
-    #[inline]
-    fn any(self) -> bool {
-        self != Replaced::No
-    }
+    /// One of those three replaced the version that the dependency declares.
+    version_was_replaced: bool,
 }
 
 /// `replacement` is where the caller keeps the version if one of the three replaces the declared
@@ -1697,7 +1680,6 @@ fn asked_version<'a>(
         _ => dependency.name_hash,
     };
 
-    let mut moved_catalog_entry = false;
     'replaced: {
         // Only a plain dependency follows a same-named `npm:` alias of the project.
         if dependency.version.tag == dependency::version::Tag::Npm
@@ -1778,10 +1760,6 @@ fn asked_version<'a>(
                         .catalogs
                         .get(&this.lockfile, *declared.catalog(), name)
                 {
-                    // An entry that only an override sends rows to stays a pin.
-                    moved_catalog_entry =
-                        package_manager_real::PackageJSONEditor::steers_catalogs_to_latest(this)
-                            && names_same_catalog(this, &dependency.version, declared);
                     let v = catalog_dep.version;
                     (name, name_hash) = update_name_and_name_hash_from_version_replacement(
                         &this.lockfile,
@@ -1804,25 +1782,8 @@ fn asked_version<'a>(
         name,
         name_hash,
         version: replacement.as_ref().unwrap_or(&dependency.version),
-        replaced: match replacement {
-            None => Replaced::No,
-            Some(_) if moved_catalog_entry => Replaced::ByMovedCatalogEntry,
-            Some(_) => Replaced::Yes,
-        },
+        version_was_replaced: replacement.is_some(),
     })
-}
-
-/// Whether the dependency's own `catalog:` names the catalog that `declared` names.
-#[cold]
-#[inline(never)]
-fn names_same_catalog(
-    this: &PackageManager,
-    own: &dependency::Version,
-    declared: &dependency::Version,
-) -> bool {
-    let buf = this.lockfile.buffers.string_bytes.as_slice();
-    own.tag == dependency::version::Tag::Catalog
-        && Lockfile::CatalogMap::same_name(own.catalog().slice(buf), declared.catalog().slice(buf))
 }
 
 /// The alias (a future folder) or the registry name of a dependency, if it is unsafe. Such a
@@ -1899,7 +1860,7 @@ pub(crate) fn bind_row(
         name,
         name_hash,
         version,
-        replaced,
+        version_was_replaced,
     } = asked;
     let mut loaded_manifest: Option<Npm::PackageManifest> = None;
 
@@ -1914,7 +1875,7 @@ pub(crate) fn bind_row(
                     name,
                     dependency,
                     version,
-                    replaced,
+                    version_was_replaced,
                     dependency.behavior,
                     id,
                     resolution,
@@ -2009,7 +1970,13 @@ pub(crate) fn bind_row(
                                     || manifest.pkg.has_extended_manifest
                                     || manifest.should_exclude_from_age_filter(excludes))
                                 && !picks_latest_tag(
-                                    this, dependency, id, name_hash, name, version, replaced,
+                                    this,
+                                    dependency,
+                                    id,
+                                    name_hash,
+                                    name,
+                                    version,
+                                    version_was_replaced,
                                 )
                                 && let Some(find_result) = manifest.find_by_version(exact)
                                 && manifest.is_in_bounds(find_result.package)
@@ -2133,7 +2100,7 @@ fn bind_row_without_manifest(
         name,
         name_hash,
         version,
-        replaced,
+        version_was_replaced,
     } = asked;
     let waiter = || {
         if is_root {
@@ -2283,7 +2250,7 @@ fn bind_row_without_manifest(
                 name,
                 dependency,
                 version,
-                replaced,
+                version_was_replaced,
                 dependency.behavior,
                 id,
                 resolution,
@@ -2350,7 +2317,7 @@ fn bind_row_without_manifest(
             });
             // Only a package.json read from the project may name a tarball in the project.
             if res.tag == ResolutionTag::LocalTarball
-                && !replaced.any()
+                && !version_was_replaced
                 && !this.lockfile.is_dependency_of_local_package(id)
                 && !this.lockfile.has_equal_root_dependency(dependency)
                 && let Some(declarer) = this.lockfile.get_parent_pkg_of_dependency(id)
@@ -3002,27 +2969,67 @@ fn links_workspace(
     .is_some()
 }
 
-fn root_workspace_package_id(
+/// The root's row for the workspace `name_hash`, and the package that the row is bound to. A row
+/// that is bound wins over one that is not.
+fn root_workspace_row(
     lockfile: &Lockfile::Lockfile,
     name_hash: PackageNameHash,
-) -> Option<PackageID> {
+) -> Option<(DependencyID, PackageID)> {
     let root_package = lockfile.root_package()?;
-    let root_dependencies = root_package
-        .dependencies
-        .get(lockfile.buffers.dependencies.as_slice());
+    let rows = root_package.dependencies;
+    let root_dependencies = rows.get(lockfile.buffers.dependencies.as_slice());
     let root_resolutions = root_package
         .resolutions
         .get(lockfile.buffers.resolutions.as_slice());
     debug_assert_eq!(root_dependencies.len(), root_resolutions.len());
-    for (root_dep, &workspace_package_id) in root_dependencies.iter().zip(root_resolutions) {
-        if workspace_package_id != invalid_package_id
-            && root_dep.version.tag == dependency::version::Tag::Workspace
+    let mut unbound = None;
+    for (row, (root_dep, &workspace_package_id)) in
+        (rows.begin()..rows.end()).zip(root_dependencies.iter().zip(root_resolutions))
+    {
+        if root_dep.version.tag == dependency::version::Tag::Workspace
             && root_dep.name_hash == name_hash
         {
-            return Some(workspace_package_id);
+            if workspace_package_id != invalid_package_id {
+                return Some((row, workspace_package_id));
+            }
+            unbound = unbound.or(Some((row, invalid_package_id)));
         }
     }
-    None
+    unbound
+}
+
+/// The package of the root's row for the workspace `name_hash`.
+fn root_workspace_package_id(
+    this: &mut PackageManager,
+    name_hash: PackageNameHash,
+) -> crate::Result<Option<PackageID>> {
+    match root_workspace_row(&this.lockfile, name_hash) {
+        Some((row, bound)) if bound == invalid_package_id => bind_root_workspace_row(this, row),
+        Some((_, bound)) => Ok(Some(bound)),
+        None => Ok(None),
+    }
+}
+
+/// The differ leaves the root's row for a workspace unbound until its turn in a bare update, and
+/// for a workspace that package.json just gained. A row that links the workspace can come first.
+#[cold]
+#[inline(never)]
+fn bind_root_workspace_row(
+    this: &mut PackageManager,
+    row: DependencyID,
+) -> crate::Result<Option<PackageID>> {
+    let root_dependency = this.lockfile.buffers.dependencies[row as usize].clone();
+    bind_row(
+        this,
+        row,
+        &root_dependency,
+        invalid_package_id,
+        false,
+        PackageManager::assign_resolution,
+        false,
+    )?;
+    let bound = this.lockfile.buffers.resolutions[row as usize];
+    Ok((bound != invalid_package_id).then_some(bound))
 }
 
 pub(crate) fn has_linkable_workspace(this: &PackageManager, name_hash: PackageNameHash) -> bool {
@@ -3384,6 +3391,8 @@ fn get_or_put_resolved_package_with_find_result(
 enum Settled {
     /// It binds to this package.
     Package(PackageID),
+    /// It links a workspace package, and the root's row for that package is not bound yet.
+    WorkspaceRow(DependencyID),
     /// The lockfile already has its resolution.
     Resolved,
     /// It is a peer that a folder, a tarball or a repository next to it provides. It stays unbound.
@@ -3427,8 +3436,14 @@ fn settle_without_manifest(
         }
         _ => return None,
     };
-    if links && let Some(workspace_id) = root_workspace_package_id(&this.lockfile, name_hash) {
-        return Some(Settled::Package(workspace_id));
+    if links {
+        match root_workspace_row(&this.lockfile, name_hash) {
+            Some((row, bound)) if bound == invalid_package_id => {
+                return Some(Settled::WorkspaceRow(row));
+            }
+            Some((_, bound)) => return Some(Settled::Package(bound)),
+            None => {}
+        }
     }
 
     if !is_peer {
@@ -3452,14 +3467,13 @@ fn get_or_put_resolved_package(
     name: SemverString,
     dependency: &Dependency,
     version: &dependency::Version,
-    replaced: Replaced,
+    version_was_replaced: bool,
     behavior: Behavior,
     dependency_id: DependencyID,
     resolution: PackageID,
     install_peer: bool,
     success_fn: SuccessFn,
 ) -> crate::Result<Option<ResolvedPackageResult>> {
-    let version_was_replaced = replaced.any();
     let latest_for_target = picks_latest_tag(
         this,
         dependency,
@@ -3467,7 +3481,7 @@ fn get_or_put_resolved_package(
         name_hash,
         name,
         version,
-        replaced,
+        version_was_replaced,
     );
     match settle_without_manifest(
         this,
@@ -3482,6 +3496,11 @@ fn get_or_put_resolved_package(
     ) {
         // make sure verifyResolutions sees this resolution as a valid package id
         Some(Settled::Package(id)) => return bind_existing(this, dependency_id, id, success_fn),
+        Some(Settled::WorkspaceRow(row)) => {
+            if let Some(id) = bind_root_workspace_row(this, row)? {
+                return bind_existing(this, dependency_id, id, success_fn);
+            }
+        }
         Some(Settled::Resolved) => {
             return Ok(Some(ResolvedPackageResult {
                 package: *this.lockfile.packages.get(resolution as usize),
@@ -3526,7 +3545,7 @@ fn get_or_put_resolved_package(
                 if version.tag == dependency::version::Tag::DistTag
                     && has_linkable_workspace(this, name_hash)
                     && this.network_task_has_failed(Task::Id::for_manifest(name_str))
-                    && let Some(id) = root_workspace_package_id(&this.lockfile, name_hash)
+                    && let Some(id) = root_workspace_package_id(this, name_hash)?
                 {
                     return bind_existing(this, dependency_id, id, success_fn);
                 }
@@ -3624,7 +3643,7 @@ fn get_or_put_resolved_package(
 
                     // A workspace stands in for a dist-tag only if the registry cannot satisfy it.
                     if version.tag == dependency::version::Tag::DistTag
-                        && let Some(id) = root_workspace_package_id(&this.lockfile, name_hash)
+                        && let Some(id) = root_workspace_package_id(this, name_hash)?
                     {
                         return bind_existing(this, dependency_id, id, success_fn);
                     }
@@ -3772,7 +3791,7 @@ fn get_or_put_resolved_package(
                     dependency.name.slice(buf),
                     buf,
                 ) {
-                    let workspace_id = root_workspace_package_id(&this.lockfile, name_hash)
+                    let workspace_id = root_workspace_package_id(this, name_hash)?
                         .ok_or(crate::Error::MissingPackageJSON)?;
                     return bind_existing(this, dependency_id, workspace_id, success_fn);
                 }
@@ -3887,8 +3906,7 @@ fn names_update_request(
         || (name_hash != dependency.name_hash && this.is_update_request(name_hash, name.slice(buf)))
 }
 
-/// The row keeps its declared specifier, and so does a catalog entry: the workspace link and the
-/// version in bun.lock are read from what package.json says. One an override replaced is not moved.
+/// The row keeps its declared specifier; one an override or a catalog replaced is not moved here.
 fn picks_latest_tag(
     this: &mut PackageManager,
     dependency: &Dependency,
@@ -3896,20 +3914,17 @@ fn picks_latest_tag(
     name_hash: PackageNameHash,
     name: SemverString,
     version: &dependency::Version,
-    replaced: Replaced,
+    version_was_replaced: bool,
 ) -> bool {
     if !this.to_update
-        || replaced == Replaced::Yes
+        || version_was_replaced
         || !this.options.do_.contains(Do::UPDATE_TO_LATEST)
         || !version.tag.is_npm()
     {
         return false;
     }
-    // Catalogs are the root's: each `catalog:` row moves with its entry, in every workspace.
-    replaced == Replaced::ByMovedCatalogEntry
-        || ((this.update_requests.is_empty()
-            || names_update_request(this, dependency, name_hash, name))
-            && update_target_declares(this, dependency_id))
+    (this.update_requests.is_empty() || names_update_request(this, dependency, name_hash, name))
+        && update_target_declares(this, dependency_id)
 }
 
 /// The targets: the `-r` / `--filter` selection, else the workspace the command runs in.

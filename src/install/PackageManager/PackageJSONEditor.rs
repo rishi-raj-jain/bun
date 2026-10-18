@@ -4,8 +4,11 @@ use std::io::Write as _;
 use bun_ast as js_ast;
 use bun_ast::{E, Expr, G};
 use bun_core::{Global, Output, strings};
+use bun_paths::path_buffer_pool;
+use bun_paths::resolve_path::{join_abs_string_buf, platform};
 use bun_semver as semver;
 
+use crate::bun_fs::FileSystem;
 use bun_install::dependency::{self, DependencyExt as _, TagExt as _};
 use bun_install::lockfile::CatalogMap;
 use bun_install::lockfile::package::PackageColumns as _;
@@ -13,6 +16,7 @@ use bun_install::{Dependency, INVALID_PACKAGE_ID, Lockfile, resolution};
 use bun_install_types::{DependencyGroup, PackageNameHash};
 
 use super::package_manager_options::{Do, Enable};
+use super::workspace_package_json_cache::{GetJSONOptions, GetResult};
 use super::{CatalogUpdateInfo, PackageManager, PackageUpdateInfo, Subcommand, UpdateRequest};
 
 type ExprDisabler = bun_ast::expr::Disabler;
@@ -609,11 +613,88 @@ pub(crate) fn record_catalog_entries(
     })
 }
 
-/// A bare `bun update --latest` that targets the root: the rows that read a catalog entry resolve
-/// the dist-tag `latest` (`picks_latest_tag`), and the catalog keeps the declared ranges.
+/// A bare `bun update --latest` that targets the root.
 #[inline]
 pub(crate) fn steers_catalogs_to_latest(manager: &PackageManager) -> bool {
     !manager.updating_catalogs.is_empty() && manager.options.do_.contains(Do::UPDATE_TO_LATEST)
+}
+
+/// An entry that only an override reaches keeps its range: no row carries a version back to it.
+/// So does an entry whose range links a workspace package: its rows bind to that package.
+#[cold]
+#[inline(never)]
+pub(crate) fn steer_used_catalogs_to_latest(
+    manager: &mut PackageManager,
+    parsed: Option<&mut Lockfile>,
+) -> Result<(), bun_alloc::AllocError> {
+    // see note in `edit_update_no_args` — always avoid the store
+    let _guard = ExprDisabler::scope();
+    let link_workspace_packages = manager.options.link_workspace_packages;
+    let log = manager.log_mut();
+    let package_json_cache = &mut manager.workspace_package_json_cache;
+    let lockfile = parsed.unwrap_or(&mut *manager.lockfile);
+
+    let top_level = strings::without_trailing_slash(FileSystem::instance().top_level_dir());
+    let mut path_buf = path_buffer_pool::get();
+    // The root's package.json, then each member's.
+    for workspace in 0..=lockfile.workspace_paths.count() {
+        let workspace_path: &[u8] = match workspace.checked_sub(1) {
+            Some(member) => lockfile.workspace_paths.values()[member]
+                .slice(lockfile.buffers.string_bytes.as_slice()),
+            None => b"",
+        };
+        let package_json_path = join_abs_string_buf::<platform::Auto>(
+            top_level,
+            &mut path_buf.0,
+            &[workspace_path, b"package.json"],
+        );
+        let options = GetJSONOptions {
+            init_reset_store: false,
+            ..Default::default()
+        };
+        let GetResult::Entry(entry) =
+            package_json_cache.get_with_path(log, package_json_path, options)
+        else {
+            continue;
+        };
+        let package_json = entry.root;
+        let mut string_buf = semver::semver_string::Buf {
+            bytes: &mut lockfile.buffers.string_bytes,
+            pool: &mut lockfile.string_pool,
+        };
+        for group in DependencyGroup::FOUR {
+            let Some(dependencies) = package_json.get(group.prop) else {
+                continue;
+            };
+            dependencies.try_for_each_property(|name, _, value| {
+                let Some(catalog_name) = value.as_utf8_string_literal().and_then(|literal| {
+                    dependency::trim_literal(literal).strip_prefix(b"catalog:")
+                }) else {
+                    return Ok(());
+                };
+                let catalog_name = strings::trim(catalog_name, &strings::WHITESPACE_CHARS);
+                let buf = string_buf.bytes.as_slice();
+                let links_workspace = (lockfile.catalogs.find(buf, catalog_name, name))
+                    .and_then(|entry| entry.version.try_npm())
+                    .is_some_and(|npm| {
+                        bun_install::lockfile::linked_workspace_path(
+                            link_workspace_packages,
+                            &lockfile.workspace_paths,
+                            &lockfile.workspace_versions,
+                            semver::string::Builder::string_hash(npm.name.slice(buf)),
+                            &npm.version,
+                            buf,
+                        )
+                        .is_some()
+                    });
+                if links_workspace {
+                    return Ok(());
+                }
+                (lockfile.catalogs).steer_to_latest(&mut string_buf, catalog_name, name)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// On the loaded lockfile, before the differ: the summary prints an entry's move as an update row.
