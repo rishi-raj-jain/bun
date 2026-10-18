@@ -5,6 +5,7 @@ import {
   bunEnv,
   bunExe,
   DirectoryTree,
+  githubTarball,
   gunzipJsonRequest,
   normalizeBunSnapshot,
   runBunInstall,
@@ -12,6 +13,7 @@ import {
   tls,
 } from "harness";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { installEnv, TestRegistry } from "registry";
 import { resolveBulkAdvisoryFixture } from "./registry/fixtures/audit/audit-fixtures";
 
@@ -123,6 +125,8 @@ type RegistryOptions = {
   rewriteTime?: Record<string, Record<string, string>>;
   // Versions added to a package's manifest, each a copy of a published one: { "a-dep": { "2.0.0": "1.0.4" } }.
   copyVersions?: Record<string, Record<string, string>>;
+  // Bytes served at a path of this server: { "/t/pkg.tgz": tarball }. Mutable, so a test can replace what a URL serves.
+  files?: Record<string, Uint8Array>;
 };
 
 // Answers the bulk-advisory endpoint itself and proxies everything else to the fixture registry, pointing manifest tarball URLs back at itself.
@@ -157,6 +161,9 @@ function startRegistry(advisories: Record<string, Advisory[]>, options: Registry
         }
         return Response.json(out);
       }
+
+      const served = options.files?.[url.pathname];
+      if (served) return new Response(served);
 
       const packageName = decodeURIComponent(url.pathname.slice(1));
       if (options.denyManifests?.has(packageName)) {
@@ -246,10 +253,10 @@ async function reinstall(dir: string, pkgJson: object) {
   await runBunInstall(installEnv(dir), dir);
 }
 
-async function run(dir: string, args: string[], root: string = dir) {
+async function run(dir: string, args: string[], root: string = dir, env: NodeJS.Dict<string> = {}) {
   await using proc = Bun.spawn({
     cmd: [bunExe(), ...args],
-    env: installEnv(root),
+    env: { ...installEnv(root), ...env },
     cwd: dir,
     stdout: "pipe",
     stderr: "pipe",
@@ -1041,6 +1048,8 @@ describe("`bun audit` with a secret in the registry URL", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [{ registry: printed, packages: ["@foo/bar"], reason: "404" }],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(fix.exitCode).toBe(0);
@@ -1517,6 +1526,8 @@ describe("`bun audit` report", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [{ registry: dead.slice(0, -1), packages: ["@types/is-number"], reason: expect.any(String) }],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(fix.exitCode).toBe(0);
@@ -1594,6 +1605,358 @@ describe("`bun audit` report", () => {
     expect(JSON.parse(fix.stdout)).toMatchObject({
       unaudited: [{ registry: registryHref(scoped), packages: ["@types/is-number"], reason }],
     });
+  });
+});
+
+// The resolution of these packages has no version. bun.lock records the one that their package.json declares.
+describe("`bun audit` of tarball and git dependencies", () => {
+  function tarball(manifest: object) {
+    return new Bun.Archive(
+      { "package/package.json": JSON.stringify(manifest), "package/index.js": "module.exports = 1;\n" },
+      { compress: "gzip" },
+    ).bytes();
+  }
+
+  // `manifest` gets the project folder, so that it can put a tarball or a repository in it.
+  async function project(
+    server: Registry,
+    manifest: (dir: string) => object | Promise<object>,
+    install: Record<string, unknown> = {},
+  ) {
+    const dir = tempDir("audit-source-", {});
+    await writeBunfig(dir, server, undefined, install);
+    await write(join(dir, "package.json"), JSON.stringify({ name: "foo", ...(await manifest(dir)) }));
+    return dir;
+  }
+
+  async function wipe(dir: string) {
+    await rm(join(dir, "node_modules"), { recursive: true, force: true });
+    await rm(join(dir, ".bun-cache"), { recursive: true, force: true });
+  }
+
+  const vul = { name: "vul", version: "1.0.0" };
+  const vulAdvisory =
+    "vul@1.0.0\n  (direct dependency)\n  high: test advisory (<2.0.0) - https://example.invalid/advisory/1\n";
+
+  const sources: Record<string, (server: Registry, dir: string) => string | Promise<string>> = {
+    "a tarball URL": server => `${registryHref(server)}/t/vul.tgz`,
+    "a file: tarball": async (_, dir) => {
+      await write(join(dir, "vendor", "vul.tgz"), await tarball(vul));
+      return "file:./vendor/vul.tgz";
+    },
+    "git": async (_, dir) => {
+      const repo = join(dir, "vul-repo");
+      await write(join(repo, "package.json"), JSON.stringify(vul));
+      for (const args of [
+        ["init", "--quiet"],
+        ["add", "--all"],
+        ["commit", "--quiet", "--message", "init"],
+      ]) {
+        const config = ["user.name=audit", "user.email=audit@example.invalid", "init.defaultBranch=main"];
+        const git = Bun.spawnSync({
+          cmd: ["git", ...config.flatMap(entry => ["-c", entry]), ...args],
+          cwd: repo,
+          env: { ...bunEnv, GIT_CONFIG_NOSYSTEM: "1" },
+        });
+        // Prints what git said when it fails. A warning next to exit code 0 is not a failure.
+        expect(git.exitCode === 0 ? "" : `git ${args[0]}: ${git.stderr}`).toBe("");
+      }
+      return `git+${pathToFileURL(repo).href}`;
+    },
+    "GitHub": () => "github:owner/vul#abc1234",
+  };
+
+  test.concurrent.each(Object.keys(sources))("sends a package that came from %s", async source => {
+    const bulkBodies: Record<string, string[]>[] = [];
+    await using server = startRegistry(
+      { vul: [adv("<2.0.0")] },
+      {
+        bulkBodies,
+        files: {
+          "/t/vul.tgz": await tarball(vul),
+          "/repos/owner/vul/tarball/abc1234": await githubTarball("owner-vul-abc1234", {
+            "package.json": JSON.stringify(vul),
+          }),
+        },
+      },
+    );
+    using dir = await project(server, async dir => ({ dependencies: { vul: await sources[source](server, dir) } }));
+    const install = await run(dir, ["install"], dir, { GITHUB_API_URL: registryHref(server) });
+    expect(install.stderr).toContain("Saved lockfile");
+    expect(install.exitCode).toBe(0);
+    expect(await lock(dir)).toContain('{ "version": "1.0.0" }');
+
+    const report = await audit(dir);
+    expect(report.stdout).toContain(vulAdvisory);
+    expect(report.exitCode).toBe(1);
+
+    // bun.lock alone has what the request needs.
+    await wipe(dir);
+    const again = await audit(dir);
+    expect(again.stdout).toContain(vulAdvisory);
+    expect(again.exitCode).toBe(1);
+    expect(bulkBodies).toEqual([{ vul: ["1.0.0"] }, { vul: ["1.0.0"] }]);
+  });
+
+  test.concurrent("sends a tarball package after bun install --lockfile-only", async () => {
+    const bulkBodies: Record<string, string[]>[] = [];
+    await using server = startRegistry(
+      { vul: [adv("<2.0.0")] },
+      { bulkBodies, files: { "/t/vul.tgz": await tarball(vul) } },
+    );
+    using dir = await project(server, () => ({ dependencies: { vul: `${registryHref(server)}/t/vul.tgz` } }));
+    expect((await run(dir, ["install", "--lockfile-only"])).exitCode).toBe(0);
+    expect(await exists(join(dir, "node_modules"))).toBe(false);
+
+    const report = await audit(dir);
+    expect(report.stdout).toContain(vulAdvisory);
+    expect(report.exitCode).toBe(1);
+    expect(bulkBodies).toEqual([{ vul: ["1.0.0"] }]);
+  });
+
+  test.concurrent("sends the name and the version of the package.json, as they are written there", async () => {
+    const bulkBodies: Record<string, string[]>[] = [];
+    await using server = startRegistry(
+      {},
+      {
+        bulkBodies,
+        files: {
+          "/t/no-deps.tgz": await tarball({ name: "no-deps", version: "9.9.9" }),
+          "/t/odd.tgz": await tarball({ name: "odd", version: "banana" }),
+          "/t/nover.tgz": await tarball({ name: "nover" }),
+        },
+      },
+    );
+    const url = (name: string) => `${registryHref(server)}/t/${name}.tgz`;
+    using dir = await project(server, () => ({
+      dependencies: { "no-deps": "1.0.0", vendored: url("no-deps"), odd: url("odd"), nover: url("nover") },
+    }));
+    await runBunInstall(installEnv(dir), dir);
+    const lockfile = await lock(dir);
+    expect(lockfile).toContain(`"vendored": ["no-deps@${url("no-deps")}", { "version": "9.9.9" }, "sha512-`);
+    expect(lockfile).toContain(`"odd": ["odd@${url("odd")}", { "version": "banana" }, "sha512-`);
+    expect(lockfile).toContain(`"nover": ["nover@${url("nover")}", { "version": "" }, "sha512-`);
+
+    // A registry copy and a tarball copy of one name are one entry. A package with no version is not sent.
+    const report = await audit(dir);
+    expect(bulkBodies.map(body => Object.entries(body).map(([name, versions]) => [name, versions.toSorted()]))).toEqual(
+      [
+        [
+          ["no-deps", ["1.0.0", "9.9.9"]],
+          ["odd", ["banana"]],
+        ],
+      ],
+    );
+    expect(normalizeBunSnapshot(report.stdout)).toBe(AUDIT_HEADER + noVulnerabilities(2));
+    expect(report.exitCode).toBe(0);
+  });
+
+  test.concurrent("prints the path through a tarball package", async () => {
+    await using server = startRegistry(
+      { "no-deps": [adv("<1.0.1")] },
+      {
+        files: {
+          "/t/wrap.tgz": await tarball({ name: "wrap", version: "1.0.0", dependencies: { "no-deps": "1.0.0" } }),
+        },
+      },
+    );
+    using dir = await project(server, () => ({ dependencies: { wrap: `${registryHref(server)}/t/wrap.tgz` } }));
+    await runBunInstall(installEnv(dir), dir);
+
+    const report = await audit(dir);
+    expect(report.stdout).toContain("no-deps@1.0.0\n  wrap > no-deps\n  high: test advisory (<1.0.1)");
+    expect(report.exitCode).toBe(1);
+  });
+
+  test.concurrent("--prod leaves out a tarball that only devDependencies need", async () => {
+    const bulkBodies: Record<string, string[]>[] = [];
+    await using server = startRegistry(
+      { vul: [adv("<2.0.0")] },
+      { bulkBodies, files: { "/t/vul.tgz": await tarball(vul) } },
+    );
+    using dir = await project(server, () => ({ devDependencies: { vul: `${registryHref(server)}/t/vul.tgz` } }));
+    await runBunInstall(installEnv(dir), dir);
+
+    const prod = await audit(dir, "--prod");
+    expect(normalizeBunSnapshot(prod.stdout)).toBe(AUDIT_HEADER + noVulnerabilities(0));
+    expect(prod.exitCode).toBe(0);
+
+    const json = await audit(dir, "--json");
+    expect(Object.keys(JSON.parse(json.stdout))).toEqual(["vul"]);
+    expect(json.exitCode).toBe(1);
+    expect(bulkBodies).toEqual([{}, { vul: ["1.0.0"] }]);
+  });
+
+  test.concurrent("audit fix reports a vulnerable tarball copy, which no registry version replaces", async () => {
+    await using server = startRegistry({ vul: [adv("<2.0.0")] }, { files: { "/t/vul.tgz": await tarball(vul) } });
+    using dir = await project(server, () => ({ dependencies: { vul: `${registryHref(server)}/t/vul.tgz` } }));
+    await runBunInstall(installEnv(dir), dir);
+    const lockBefore = await lock(dir);
+
+    const fix = await auditFix(dir);
+    expect(fix.stdout).toContain("not from a registry, no fix available:\n  vul@1.0.0  1\n");
+    expect(fix.exitCode).toBe(1);
+    expect(await lock(dir)).toBe(lockBefore);
+
+    const json = await auditFix(dir, "--json");
+    expect(JSON.parse(json.stdout)).toMatchObject({
+      fixes: [],
+      notFromRegistry: [{ name: "vul", version: "1.0.0", advisories: ["1"] }],
+      unrecorded: [],
+      remaining: 1,
+    });
+    expect(json.exitCode).toBe(1);
+  });
+
+  // A bun.lock as an older bun wrote it: the same rows without the version.
+  async function legacyProject(server: Registry, install: Record<string, unknown> = {}) {
+    const url = `${registryHref(server)}/t/vul.tgz`;
+    const dir = await project(server, () => ({ dependencies: { vul: url } }), install);
+    await runBunInstall(installEnv(dir), dir);
+    const recorded = await lock(dir);
+    const legacy = recorded.replace('{ "version": "1.0.0" }', "{}");
+    expect(legacy).not.toBe(recorded);
+    await write(join(dir, "bun.lock"), legacy);
+    return { dir, url, recorded, legacy };
+  }
+
+  test.concurrent("a bun.lock with no version for a tarball fails the audit and names the package", async () => {
+    const bulkBodies: Record<string, string[]>[] = [];
+    await using server = startRegistry(
+      { vul: [adv("<2.0.0")] },
+      { bulkBodies, files: { "/t/vul.tgz": await tarball(vul) } },
+    );
+    const { dir, url } = await legacyProject(server);
+    using _ = dir;
+
+    const report = await audit(dir);
+    expect(normalizeBunSnapshot(report.stdout)).toBe(AUDIT_HEADER + noVulnerabilities(0, "1 not audited"));
+    expect(report.stderr).toBe(
+      `error: cannot audit vul@${url}: no version in lockfile\nnote: run 'bun update vul' to record it\n`,
+    );
+    expect(report.exitCode).toBe(1);
+
+    const json = await audit(dir, "--json");
+    expect(json.stdout).toBe("{}\n");
+    expect(json.exitCode).toBe(1);
+    expect(bulkBodies).toEqual([{}, {}]);
+  });
+
+  test.concurrent("names the dependency that bun update takes, and says when there is none", async () => {
+    const files: Record<string, Uint8Array> = { "/t/vul.tgz": await tarball(vul) };
+    await using server = startRegistry({}, { files });
+    const at = (name: string) => `${registryHref(server)}/t/${name}.tgz`;
+    // `wrap` depends on the URL of `vul`, which has the port of the server.
+    files["/t/wrap.tgz"] = await tarball({ name: "wrap", version: "1.0.0", dependencies: { vul: at("vul") } });
+    using dir = await project(server, () => ({ dependencies: { alias: at("wrap") } }));
+    await runBunInstall(installEnv(dir), dir);
+    const recorded = await lock(dir);
+    expect(recorded.match(/\{ "version": "1\.0\.0"/g)).toHaveLength(2);
+    await write(
+      join(dir, "bun.lock"),
+      recorded.replaceAll('"version": "1.0.0", ', "").replaceAll('{ "version": "1.0.0" }', "{}"),
+    );
+
+    const report = await audit(dir);
+    expect(report.stderr).toBe(
+      `error: cannot audit wrap@${at("wrap")}, vul@${at("vul")}: no version in lockfile\n` +
+        "note: run 'bun update alias' to record it\n" +
+        "note: 'bun install' records the version of packages it downloads\n",
+    );
+    expect(normalizeBunSnapshot(report.stdout)).toBe(AUDIT_HEADER + noVulnerabilities(0, "2 not audited"));
+    expect(report.exitCode).toBe(1);
+  });
+
+  test.concurrent("audit fix fails on a bun.lock with no version for a tarball", async () => {
+    await using server = startRegistry({ vul: [adv("<2.0.0")] }, { files: { "/t/vul.tgz": await tarball(vul) } });
+    const { dir, url, legacy } = await legacyProject(server);
+    using _ = dir;
+
+    const fix = await auditFix(dir);
+    expect(normalizeBunSnapshot(fix.stdout)).toBe(FIX_HEADER + noVulnerabilities(0, "1 not audited"));
+    expect(fix.stderr).toContain("error: cannot audit vul@");
+    expect(fix.exitCode).toBe(1);
+    expect(await lock(dir)).toBe(legacy);
+
+    const json = await auditFix(dir, "--json", "--dry-run");
+    expect(JSON.parse(json.stdout)).toMatchObject({
+      fixes: [],
+      unrecorded: [{ name: "vul", resolution: url, dependency: "vul" }],
+    });
+    expect(json.exitCode).toBe(1);
+  });
+
+  describe.each(["hoisted", "isolated"])("with the %s linker", linker => {
+    test.concurrent("an install that extracts the tarball records its version", async () => {
+      const bulkBodies: Record<string, string[]>[] = [];
+      await using server = startRegistry(
+        { vul: [adv("<2.0.0")] },
+        { bulkBodies, files: { "/t/vul.tgz": await tarball(vul) } },
+      );
+      const { dir, recorded } = await legacyProject(server, { linker });
+      using _ = dir;
+      await wipe(dir);
+
+      const install = await run(dir, ["install"]);
+      expect(install.stderr).toContain("Saved lockfile");
+      expect(install.exitCode).toBe(0);
+      expect(await lock(dir)).toBe(recorded);
+
+      const report = await audit(dir);
+      expect(report.stdout).toContain(vulAdvisory);
+      expect(report.exitCode).toBe(1);
+      expect(bulkBodies).toEqual([{ vul: ["1.0.0"] }]);
+    });
+
+    test.concurrent("a frozen install leaves the lockfile as it is", async () => {
+      await using server = startRegistry({ vul: [adv("<2.0.0")] }, { files: { "/t/vul.tgz": await tarball(vul) } });
+      const { dir, legacy } = await legacyProject(server, { linker });
+      using _ = dir;
+      await wipe(dir);
+
+      const install = await run(dir, ["install", "--frozen-lockfile"]);
+      expect(install.exitCode).toBe(0);
+      expect(await lock(dir)).toBe(legacy);
+
+      const report = await audit(dir);
+      expect(normalizeBunSnapshot(report.stdout)).toBe(AUDIT_HEADER + noVulnerabilities(0, "1 not audited"));
+      expect(report.exitCode).toBe(1);
+    });
+  });
+
+  test.concurrent("bun update <name> records the version when the cache has the package", async () => {
+    await using server = startRegistry({ vul: [adv("<2.0.0")] }, { files: { "/t/vul.tgz": await tarball(vul) } });
+    const { dir, recorded } = await legacyProject(server);
+    using _ = dir;
+
+    // Nothing to extract: node_modules and the cache have the package.
+    expect((await run(dir, ["install"])).exitCode).toBe(0);
+    expect(await lock(dir)).not.toContain('"version"');
+
+    expect((await run(dir, ["update", "vul"])).exitCode).toBe(0);
+    expect(await lock(dir)).toBe(recorded);
+
+    const report = await audit(dir);
+    expect(report.stdout).toContain(vulAdvisory);
+    expect(report.exitCode).toBe(1);
+  });
+
+  test.concurrent("bun update records the version of the new build of a tarball", async () => {
+    const bulkBodies: Record<string, string[]>[] = [];
+    const files: Record<string, Uint8Array> = { "/t/vul.tgz": await tarball(vul) };
+    await using server = startRegistry({ vul: [adv("<2.0.0")] }, { bulkBodies, files });
+    using dir = await project(server, () => ({ dependencies: { vul: `${registryHref(server)}/t/vul.tgz` } }));
+    await runBunInstall(installEnv(dir), dir);
+    expect(await lock(dir)).toContain('{ "version": "1.0.0" }');
+
+    files["/t/vul.tgz"] = await tarball({ name: "vul", version: "2.0.0" });
+    expect((await run(dir, ["update", "vul"])).exitCode).toBe(0);
+    expect(await lock(dir)).toContain('{ "version": "2.0.0" }');
+
+    const report = await audit(dir);
+    expect(normalizeBunSnapshot(report.stdout)).toBe(AUDIT_HEADER + noVulnerabilities(1));
+    expect(report.exitCode).toBe(0);
+    expect(bulkBodies).toEqual([{ vul: ["2.0.0"] }]);
   });
 });
 
@@ -1843,6 +2206,8 @@ describe("`bun audit fix`", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(exitCode).toBe(0);
@@ -3806,6 +4171,8 @@ describe("`bun audit fix`", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(exitCode).toBe(0);
@@ -3869,6 +4236,8 @@ describe("`bun audit fix`", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [{ name: "no-deps", version: "1.0.1", advisories: ["2"] }],
     });
     expect(exitCode).toBe(1);
@@ -3914,6 +4283,8 @@ describe("`bun audit fix`", () => {
       remaining: 1,
       fixes: [{ name: "a-dep", from: "1.0.2", to: "1.0.4" }],
       blocked: [{ name: "no-deps", from: "1.0.1", to: "1.1.0", blockers: [{ dependent: "one-dep@1.0.0" }] }],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(exitCode).toBe(1);
@@ -4043,6 +4414,8 @@ describe("`bun audit fix`", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [{ registry: registryHref(scoped), packages: ["@types/is-number"], reason: "404" }],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(exitCode).toBe(0);
@@ -4434,6 +4807,8 @@ describe("`bun audit fix`", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(exitCode).toBe(1);
@@ -4458,6 +4833,8 @@ describe("`bun audit fix`", () => {
       manifestUnavailable: [{ name: "a-dep", from: "1.0.2", error: "404" }],
       unmatched: [],
       unaudited: [],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [],
     });
     expect(exitCode).toBe(1);
@@ -4494,6 +4871,8 @@ describe("`bun audit fix`", () => {
       manifestUnavailable: [],
       unmatched: [],
       unaudited: [],
+      notFromRegistry: [],
+      unrecorded: [],
       vulnerableAfterInstall: [{ name: "no-deps", version: "2.0.0", advisories: ["2"] }],
     });
     expect(exitCode).toBe(1);
