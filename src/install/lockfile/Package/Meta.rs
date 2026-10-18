@@ -6,7 +6,7 @@ use bun_semver::String;
 use crate::lockfile_real::StringBuilder as LockfileStringBuilder;
 
 // TODO: when we bump the lockfile version, we should reorder this to:
-// id(32), arch(16), os(16), id(8), man_dir(8), has_install_script(8), integrity(72 align 8)
+// id(32), arch(16), os(16), id(8), package_json_version(8), has_install_script(8), integrity(72 align 8)
 // should allow us to remove padding bytes
 
 // TODO: remove origin. it doesnt do anything and can be inferred from the resolution
@@ -20,11 +20,15 @@ pub struct Meta {
     pub(crate) os: OperatingSystem,
     /// In former padding: an older `bun.lockb` reads back as `Libc::NONE` (not declared).
     pub(crate) libc: Libc,
-    pub(crate) _padding_libc: u8,
+    /// In former padding: a row that an older bun wrote reads back as `VersionRecord::UNKNOWN`.
+    pub(crate) version_record: VersionRecord,
 
     pub(crate) id: PackageID,
 
-    pub(crate) man_dir: String,
+    /// The `version` that the package.json of a tarball, git or GitHub package declares, as
+    /// written there. Empty when that package.json has none. Only meaningful with
+    /// `VersionRecord::RECORDED`. A registry package has its version in the resolution.
+    pub(crate) package_json_version: String,
     pub(crate) integrity: Integrity,
 
     /// Shouldn't be used directly. Use `Meta.has_install_script()` and
@@ -36,6 +40,22 @@ pub struct Meta {
     pub(crate) has_install_script: HasInstallScript,
 
     pub(crate) _padding_integrity: [u8; 2],
+}
+
+// A byte of former padding and a slot that no older bun assigned: both are zero in every
+// `bun.lockb` written before they had a meaning.
+const _: () = assert!(core::mem::offset_of!(Meta, version_record) == 7);
+const _: () = assert!(core::mem::offset_of!(Meta, package_json_version) == 12);
+
+/// Whether `Meta::package_json_version` was read from the package's package.json. Not an enum:
+/// `bun.lockb` is loaded without a check of this byte.
+#[repr(transparent)]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct VersionRecord(pub u8);
+
+impl VersionRecord {
+    pub const UNKNOWN: Self = Self(0);
+    pub const RECORDED: Self = Self(1);
 }
 
 #[repr(u8)]
@@ -55,9 +75,9 @@ impl Default for Meta {
             arch: Architecture::ALL,
             os: OperatingSystem::ALL,
             libc: Libc::NONE,
-            _padding_libc: 0,
+            version_record: VersionRecord::UNKNOWN,
             id: INVALID_PACKAGE_ID,
-            man_dir: String::default(),
+            package_json_version: String::default(),
             integrity: Integrity::default(),
             has_install_script: HasInstallScript::False,
             _padding_integrity: [0; 2],
@@ -92,7 +112,23 @@ impl Meta {
     // `StringBuilder`, so take it directly instead of a placeholder trait that
     // nothing implements.
     pub(crate) fn count(&self, buf: &[u8], builder: &mut LockfileStringBuilder<'_>) {
-        builder.count(self.man_dir.slice(buf));
+        builder.count(self.package_json_version.slice(buf));
+    }
+
+    pub(crate) fn has_recorded_version(&self) -> bool {
+        self.version_record == VersionRecord::RECORDED
+    }
+
+    /// The recorded package.json version, empty when the package.json has none. `None` when no
+    /// version was recorded for this row.
+    pub(crate) fn recorded_version<'a>(&'a self, buf: &'a [u8]) -> Option<&'a [u8]> {
+        self.has_recorded_version()
+            .then(|| self.package_json_version.slice(buf))
+    }
+
+    pub(crate) fn record_version(&mut self, version: String) {
+        self.package_json_version = version;
+        self.version_record = VersionRecord::RECORDED;
     }
 
     pub(crate) fn init() -> Meta {
@@ -109,7 +145,8 @@ impl Meta {
     ) -> Meta {
         Meta {
             id,
-            man_dir: builder.append::<String>(self.man_dir.slice(buf)),
+            package_json_version: builder.append::<String>(self.package_json_version.slice(buf)),
+            version_record: self.version_record,
             integrity: self.integrity,
             arch: self.arch,
             os: self.os,

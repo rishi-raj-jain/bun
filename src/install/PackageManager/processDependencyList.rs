@@ -9,7 +9,7 @@ use crate::bun_json::Expr;
 use crate::dependency::{TagExt as _, VersionTag};
 use crate::lockfile_real::package::{Package, PackageColumns, ResolverContext};
 use crate::lockfile_real::{DependencySlice, Lockfile, PackageIDSlice, QueuedRows, StringBuilder};
-use crate::package_manager_real::options::LogLevel;
+use crate::package_manager_real::options::{Enable, LogLevel};
 use crate::package_manager_real::{ArrivedPackage, PackageManager, RemoteTurn, enqueue, run_tasks};
 use crate::package_manager_task as Task;
 use crate::repository_real::{RepositoryExt as _, locked_scp_like};
@@ -180,6 +180,14 @@ impl PackageManager {
                 _ => false,
             };
             if !(from_lockfile && moved) {
+                // A row from before the version was recorded.
+                if package.meta.has_recorded_version() && !existing.meta.has_recorded_version() {
+                    existing
+                        .meta
+                        .record_version(package.meta.package_json_version);
+                    self.lockfile.packages.set(existing_id as usize, existing);
+                    self.options.enable.set(Enable::FORCE_SAVE_LOCKFILE, true);
+                }
                 return existing;
             }
             if existing.resolution.tag.is_tarball() && existing.meta.integrity.tag.is_supported() {
@@ -198,6 +206,8 @@ impl PackageManager {
             existing.dependencies = package.dependencies;
             existing.resolutions = package.resolutions;
             existing.bin = package.bin;
+            existing.meta.package_json_version = package.meta.package_json_version;
+            existing.meta.version_record = package.meta.version_record;
             if data.integrity.tag.is_supported() {
                 existing.meta.integrity = data.integrity;
             }
@@ -457,6 +467,7 @@ impl PackageManager {
                         pkg.resolution = resolver
                             .resolve(&mut builder, &Expr::default())
                             .expect("unreachable");
+                        pkg.meta.record_version(SemverString::default());
                     }
 
                     pkg
@@ -489,6 +500,44 @@ impl PackageManager {
             }
             _ => None,
         }
+    }
+
+    /// The installers extracted a tarball, git or GitHub package whose lockfile row has no
+    /// version, because an older bun wrote it. The package.json that came with the extraction has
+    /// it. It is recorded by `record_extracted_versions`, after the installers: appending a
+    /// string can move the buffer that their tasks read.
+    pub(crate) fn queue_extracted_version(&mut self, package_id: PackageID, data: &ExtractData) {
+        let tag = self.lockfile.packages.items_resolution()[package_id as usize].tag;
+        if !tag.records_package_json_version()
+            || self.lockfile.packages.items_meta()[package_id as usize].has_recorded_version()
+            // The bytes were not checked against what the lockfile pins.
+            || self.skips_verify(tag)
+            || (self.extracted_versions.iter()).any(|(queued, _)| *queued == package_id)
+        {
+            return;
+        }
+        let version: Box<[u8]> = match &data.json {
+            Some(json) => {
+                match crate::lockfile_real::package::version_in_package_json(&json.path, &json.buf)
+                {
+                    Some(version) => version,
+                    None => return,
+                }
+            }
+            // A repository with no package.json. The extraction of a tarball fails without one.
+            None if tag.is_git() => Box::default(),
+            None => return,
+        };
+        self.extracted_versions.push((package_id, version));
+        self.options.enable.set(Enable::FORCE_SAVE_LOCKFILE, true);
+    }
+
+    pub(crate) fn record_extracted_versions(&mut self) -> Result<(), bun_alloc::AllocError> {
+        for (package_id, version) in core::mem::take(&mut self.extracted_versions) {
+            let version = self.lockfile.string_buf().append(&version)?;
+            self.lockfile.packages.items_meta_mut()[package_id as usize].record_version(version);
+        }
+        Ok(())
     }
 
     /// Whether the package that `task_id` has downloaded waits for its turn, see `RemotePackages`.

@@ -488,6 +488,9 @@ pub struct PackageManager {
     pub(crate) update_requests: Box<[UpdateRequest]>,
     pub(crate) update_request_index: update_request::UpdateRequestIndex,
     pub audit_fix_pins: Box<[crate::audit_fix::PlannedFix]>,
+    /// Package.json versions that the installers read for lockfile rows that have none. See
+    /// `queue_extracted_version`.
+    pub(crate) extracted_versions: Vec<(PackageID, Box<[u8]>)>,
 
     /// Only set in `bun pm`
     pub root_package_json_name_at_time_of_init: Box<[u8]>,
@@ -1714,6 +1717,7 @@ fn allocate_package_manager(
         wr!(update_requests, Box::default());
         wr!(update_request_index, Default::default());
         wr!(audit_fix_pins, Box::default());
+        wr!(extracted_versions, Vec::new());
         wr!(root_package_id, RootPackageId::default());
         wr!(workspace_root_name_hash, 0);
         wr!(workspace_root_version, Box::default());

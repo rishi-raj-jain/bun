@@ -274,6 +274,7 @@ impl<'a> Installer<'a> {
             if data.integrity.tag.is_supported() {
                 self.record_extracted_integrity(pkg_id, &data.integrity);
             }
+            self.manager_mut().queue_extracted_version(pkg_id, data);
 
             let patched = self
                 .package_patch_info(pkg_id)

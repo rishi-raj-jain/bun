@@ -1564,6 +1564,7 @@ impl<'a> PackageInstaller<'a> {
                     .set(Options::Enable::FORCE_SAVE_LOCKFILE, true);
             }
         }
+        self.manager_mut().queue_extracted_version(package_id, data);
 
         if let Some(removed) = self.manager_mut().task_queue.fetch_remove(&task_id) {
             let callbacks = removed.value;

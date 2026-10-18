@@ -404,6 +404,20 @@ impl Scripts {
     }
 }
 
+/// What a lockfile records as the version of a package that was fetched: from a registry, a
+/// tarball, git or GitHub. See `Lockfile::recorded_version`.
+#[derive(Clone, Copy)]
+pub enum RecordedVersion<'a> {
+    /// A registry package: the version in its resolution.
+    Registry(&'a Semver::Version),
+    /// A tarball, git or GitHub package: the `version` of its package.json, as written there.
+    PackageJson(&'a [u8]),
+    /// A tarball, git or GitHub package whose package.json declares no version.
+    Unversioned,
+    /// A tarball, git or GitHub row that no bun with this record has resolved or extracted.
+    Unknown,
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // LoadResult
 // ────────────────────────────────────────────────────────────────────────────
@@ -848,6 +862,27 @@ impl Lockfile {
                 .copied(),
             _ => None,
         }
+    }
+
+    /// What this lockfile records as the version of package `id`. `None` for the project's own
+    /// packages: the root, a workspace, a `file:` folder, a `link:`.
+    #[inline]
+    pub(crate) fn recorded_version(&self, id: PackageID) -> Option<RecordedVersion<'_>> {
+        let resolution = &self.packages.items_resolution()[id as usize];
+        if resolution.tag == ResolutionTag::Npm {
+            return Some(RecordedVersion::Registry(&resolution.npm().version));
+        }
+        if !resolution.tag.records_package_json_version() {
+            return None;
+        }
+        let meta = &self.packages.items_meta()[id as usize];
+        Some(
+            match meta.recorded_version(self.buffers.string_bytes.as_slice()) {
+                None => RecordedVersion::Unknown,
+                Some([]) => RecordedVersion::Unversioned,
+                Some(version) => RecordedVersion::PackageJson(version),
+            },
+        )
     }
 
     /// An optional peer, or a peer no rule overrides that is bound to a version its range rejects.

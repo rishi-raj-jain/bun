@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use crate::Origin;
 use crate::lockfile_real::package::meta::HasInstallScript;
 use crate::lockfile_real::package::{
-    Meta as PackageMeta, Package as LockfilePackage, PackageColumns as _,
+    Meta as PackageMeta, Package as LockfilePackage, PackageColumns as _, recordable_version,
 };
 use crate::lockfile_real::{self as lockfile, LoadResult, Lockfile};
 use crate::migration::{sbuf, string_hash};
@@ -169,6 +169,12 @@ impl<'a> Entry<'a> {
             }
             _ => integrity,
         }
+    }
+
+    /// `None` when `version` is not a version: `bun install --yarn` writes the resolution there.
+    fn package_json_version(&self) -> Option<&'a [u8]> {
+        let version = Semver::SlicedString::init(self.version, self.version);
+        Semver::Version::parse_exact(version).map(|_| self.version)
     }
 
     pub(crate) fn file_path_from_spec(spec: &[u8]) -> &[u8] {
@@ -776,7 +782,7 @@ pub(crate) fn migrate_yarn_lockfile<'a>(
                 origin: Origin::Npm,
                 arch: entry.cpu.combine(),
                 os: entry.os.combine(),
-                man_dir: SemverString::default(),
+                package_json_version: SemverString::default(),
                 has_install_script: HasInstallScript::False,
                 integrity: entry.tarball_integrity(),
                 ..Default::default()
@@ -784,6 +790,12 @@ pub(crate) fn migrate_yarn_lockfile<'a>(
             bin: Bin::init(),
             scripts: Default::default(),
         };
+        if resolution.tag.records_package_json_version()
+            && let Some(version) = entry.package_json_version()
+        {
+            let version = sbuf!(this).append(recordable_version(version))?;
+            package.meta.record_version(version);
+        }
         // yarn.lock does not record bins. For a `file:` folder or a `link:`, they are read from the
         // package.json on disk.
         if matches!(

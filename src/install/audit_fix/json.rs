@@ -81,6 +81,18 @@ pub(super) fn write(plan: &FixPlan, outcome: Option<&FixOutcome>, dry_run: bool)
         );
     }
 
+    out.extend_from_slice(b"],\"notFromRegistry\":[");
+    for (i, copy) in plan.not_from_registry.iter().enumerate() {
+        comma(&mut out, i);
+        name_advisories(
+            &mut out,
+            b"version",
+            &copy.name,
+            &copy.from,
+            &copy.ignore_tokens,
+        );
+    }
+
     out.extend_from_slice(b"],\"manifestUnavailable\":[");
     for (i, unavailable) in plan.manifest_unavailable.iter().enumerate() {
         comma(&mut out, i);
@@ -124,6 +136,22 @@ pub(super) fn write(plan: &FixPlan, outcome: Option<&FixOutcome>, dry_run: bool)
             out.extend_from_slice(b"null");
         } else {
             s(&mut out, &group.reason);
+        }
+        out.push(b'}');
+    }
+
+    out.extend_from_slice(b"],\"unrecorded\":[");
+    for (i, package) in plan.unrecorded.iter().enumerate() {
+        comma(&mut out, i);
+        out.extend_from_slice(b"{\"name\":");
+        s(&mut out, &package.name);
+        out.extend_from_slice(b",\"resolution\":");
+        s(&mut out, &package.resolution);
+        out.extend_from_slice(b",\"dependency\":");
+        if package.dependency.is_empty() {
+            out.extend_from_slice(b"null");
+        } else {
+            s(&mut out, &package.dependency);
         }
         out.push(b'}');
     }

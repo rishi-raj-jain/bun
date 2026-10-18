@@ -981,6 +981,8 @@ pub fn install_with_manager(
         .filter(|_| install_summary.fail == 0)
         .map(crate::prune::OldModules::remove);
 
+    manager.record_extracted_versions()?;
+
     let did_meta_hash_change =
         // If the lockfile was frozen, we already checked it
         !manager.options.enable.frozen_lockfile()

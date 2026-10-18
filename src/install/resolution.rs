@@ -1050,6 +1050,12 @@ impl Tag {
         self == Tag::LocalTarball || self == Tag::RemoteTarball
     }
 
+    /// The version of such a package is only in its package.json, so its lockfile row records it
+    /// in `Meta::package_json_version`.
+    pub(crate) fn records_package_json_version(self) -> bool {
+        self.is_tarball() || self.is_git()
+    }
+
     /// `Uninitialized` precedes a package's append; `SingleFileModule` has no producer.
     pub(crate) fn belongs_in_lockfile(self) -> bool {
         matches!(

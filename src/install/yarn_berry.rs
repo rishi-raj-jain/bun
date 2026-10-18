@@ -12,6 +12,7 @@ use crate::bin::Bin;
 use crate::dependency::{self, Behavior, Dependency, DependencyExt as _, VersionTag};
 use crate::lockfile::package::PackageColumns as _;
 use crate::lockfile::{self, LoadResult, LoadResultOk, Lockfile};
+use crate::lockfile_real::package::recordable_version;
 use crate::lockfile_real::package::workspace_map::{MissingWorkspace, WorkspaceMap};
 use crate::lockfile_real::package_extensions::{self, Kind as ExtensionKind};
 use crate::lockfile_real::reachable;
@@ -984,6 +985,13 @@ pub(crate) fn migrate_yarn_berry_lockfile<'a>(
         }
         if let Some(cond) = get_str(&entry_expr, b"conditions") {
             (pkg.meta.os, pkg.meta.arch, pkg.meta.libc) = parse_conditions(cond);
+        }
+        if resolution.tag.records_package_json_version()
+            && let Some(field) = entry_expr.get(b"version")
+            && let Some(version) = scalar_text(data, &field)
+        {
+            let version = sbuf!(this).append(recordable_version(version))?;
+            pkg.meta.record_version(version);
         }
         let pid = this.append_package_dedupe(&mut pkg)?;
         entries[i].package_id = pid;

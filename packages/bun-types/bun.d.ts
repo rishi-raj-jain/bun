@@ -10714,6 +10714,12 @@ declare module "bun" {
   };
 
   type BunLockFilePackageInfo = BunLockFileBasePackageInfo & {
+    /**
+     * The `version` in the `package.json` of a tarball, git or github package, as written there.
+     * An empty string when that `package.json` has none. Absent for every other kind of package,
+     * and in a lockfile that an older Bun wrote.
+     */
+    version?: string;
     os?: string | string[];
     cpu?: string | string[];
     hasInstallScript?: true;
