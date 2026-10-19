@@ -333,16 +333,14 @@ const kUserUnrefed = Symbol("kUserUnrefed");
 const kPausedUnref = Symbol("kPausedUnref");
 const kOnreadDeliver = Symbol("kOnreadDeliver");
 function noop() {}
-function onUpgradeAttachedWrite(chunk, encoding, callback, onClose) {
+function onUpgradeAttachedWrite(chunk, encoding, req, onClose) {
   this.off("close", onClose);
-  this._write(chunk, encoding, callback);
+  runInWriteFrame(req.frame, this._write, this, chunk, encoding, req.callback);
 }
 
-function onUpgradeWriteClose(callback) {
+function onUpgradeWriteClose(req) {
   // ServerHandlers.error may have already failed this write.
-  if (this[kwriteCallback] !== callback) return;
-  this[kwriteCallback] = null;
-  callback($ERR_SOCKET_CLOSED());
+  if (this[kwriteCallback] === req) completeWrite(this, $ERR_SOCKET_CLOSED());
 }
 const kUpgradeAttached = Symbol("kUpgradeAttached");
 const kOnreadTail = Symbol("kOnreadTail");
@@ -352,6 +350,30 @@ const kOnreadPendingEnd = Symbol("kOnreadPendingEnd");
 const kOnreadReadRequested = Symbol("kOnreadReadRequested");
 const kOnreadEmptyTail = Buffer.alloc(0);
 const kwriteCallback = Symbol("writeCallback");
+type WriteCallback = (err?: Error | null) => void;
+// What [kwriteCallback] holds while a write waits for its handle: the stream's callback with the async context
+// `_write` was called in. Node keeps that context in the handle's write request, so whichever event completes the
+// write, its callback and the 'drain' or 'finish' after it run where the write was issued, not where the socket was
+// opened. A write that waits for 'connect' is the bare callback: Node issues that one from the event.
+// https://github.com/nodejs/node/blob/v26.3.0/lib/internal/stream_base_commons.js#L81-L119
+type ParkedWrite = WriteCallback | { callback: WriteCallback; frame: unknown };
+function parkWrite(self, callback: WriteCallback) {
+  return (self[kwriteCallback] = { callback, frame: $getInternalField($asyncContext, 0) });
+}
+// `fn.$call(thisArg, a, b, c)` in `frame`. A program with no AsyncLocalStorage is in it already.
+function runInWriteFrame(frame, fn, thisArg?, a?, b?, c?) {
+  if (frame === $getInternalField($asyncContext, 0)) return fn.$call(thisArg, a, b, c);
+  return require("internal/async_context_frame").runInSameGraph(frame, fn, thisArg, a, b, c);
+}
+// The one way a parked write is called back. The slot is cleared first: the stream issues its next write from the callback.
+function completeWrite(self, err) {
+  const req: ParkedWrite | null | undefined = self[kwriteCallback];
+  if (!req) return false;
+  self[kwriteCallback] = null;
+  if (typeof req === "function") req(err);
+  else runInWriteFrame(req.frame, req.callback, undefined, err);
+  return true;
+}
 const kRejectedWrite = Symbol("kRejectedWrite");
 const kSocketClass = Symbol("kSocketClass");
 
@@ -362,11 +384,11 @@ function failWrite(self, negErrno, callback) {
   failWriteWith(self, writeErrnoException(negErrno), callback);
 }
 // The TLS engine ended the write side only. It reads what the peer sent, then closes, and the write fails with that close.
-function holdRejectedWrite(self, handle, negErrno, callback) {
+// The write stays parked until then: the caller parks one that `_write` is issuing.
+function holdRejectedWrite(self, handle, negErrno) {
   if (!self.encrypted || self[kclosed]) return false;
   if (self[kupgraded] && !(self[kupgraded] instanceof Socket)) return false;
   self._pendingData = null;
-  self[kwriteCallback] = callback;
   self[kRejectedWrite] = writeErrnoException(negErrno);
   // It holds the loop as any pending write does (_write).
   if ((self[kended] || self[kPausedUnref]) && !self[kUserUnrefed]) handle.ref?.();
@@ -385,7 +407,11 @@ function failRejectedWrite(self) {
   failWriteWith(self, er, self[kwriteCallback]);
   return true;
 }
-function failWriteWith(self, er, callback) {
+function failWriteWith(self, er, callback: ParkedWrite | null | undefined) {
+  // The callback and the destroy after it, where the write was issued.
+  if (callback && typeof callback !== "function") {
+    return runInWriteFrame(callback.frame, failWriteWith, undefined, self, er, callback.callback);
+  }
   self._pendingData = null;
   self[kwriteCallback] = null;
   if (callback) {
@@ -828,18 +854,18 @@ const SocketHandlers = {
   drain(socket, rejected?: number) {
     const self = socket.data;
     if (!self) return;
-    const callback = self[kwriteCallback];
+    const req = self[kwriteCallback];
     self.connecting = false;
-    if (callback && self[kRejectedWrite] === undefined) {
+    if (req && self[kRejectedWrite] === undefined) {
       const writeChunk = self._pendingData;
       const res = rejected ?? socket.$write(writeChunk || "", self._pendingEncoding || "utf8");
       if (typeof res === "number" && res < 0) {
         // The retried send failed for good (peer gone): $write returned -errno.
-        if (!holdRejectedWrite(self, socket, res, callback)) failWrite(self, res, callback);
+        if (!holdRejectedWrite(self, socket, res)) failWrite(self, res, req);
       } else if (res) {
-        self._pendingData = self[kwriteCallback] = null;
+        self._pendingData = null;
         unrefAfterDrain(self, socket);
-        callback(null);
+        completeWrite(self, null);
       } else {
         self._pendingData = null;
       }
@@ -879,11 +905,8 @@ const SocketHandlers = {
     if (self._hadError) return;
     self._hadError = true;
 
-    const callback = self[kwriteCallback];
-    if (callback) {
-      self[kwriteCallback] = null;
-      callback(error);
-    }
+    // A parked write that fails destroys the socket, and that reports the error: once, where the write was issued.
+    if (completeWrite(self, error) && self.destroyed) return;
 
     self.emit("error", error);
   },
@@ -1082,11 +1105,7 @@ function SocketEmitEndNT(self, _err?) {
   // socket is gone - fail it so 'finish'/destroy are not stuck behind it.
   // kclosed, not _err: a native close can carry no error. A half-open 'end'
   // also lands here, and its write stays parked because it can still drain.
-  const pendingWrite = self[kwriteCallback];
-  if (pendingWrite && (self[kclosed] || self.destroyed)) {
-    self[kwriteCallback] = null;
-    pendingWrite(_err ?? $ERR_SOCKET_CLOSED());
-  }
+  if (self[kwriteCallback] && (self[kclosed] || self.destroyed)) completeWrite(self, _err ?? $ERR_SOCKET_CLOSED());
 }
 
 // --- SNICallback dispatch helpers (hoisted: no per-handshake closures) ---
@@ -1420,11 +1439,7 @@ const ServerHandlers = {
     if (typeof bunTLS === "function") {
       const tlsError = establishedTLSError(data, error);
       if (tlsError) error = tlsError;
-      const callback = data[kwriteCallback];
-      if (callback) {
-        data[kwriteCallback] = null;
-        callback(error);
-      }
+      const failedWrite = completeWrite(data, error);
       // Mirrors node's onerror:
       // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L467-L498
       if (!data._secureEstablished) {
@@ -1440,7 +1455,7 @@ const ServerHandlers = {
       ) {
         // Ignore server's authorization errors
         data.destroy();
-      } else if (tlsError && !callback) {
+      } else if (tlsError && !failedWrite) {
         data._emitTLSError(error);
       } else {
         // Node emits through _emitTLSError and leaves the socket alive. Bun
@@ -1458,13 +1473,9 @@ const ServerHandlers = {
     // the server behind an un-failed pending write (test-net-stream on
     // darwin). Shape it like Node's onWriteComplete: fail the pending write
     // callback, then destroy with the error. destroy() owns the single
-    // 'error' emission via the stream's errorEmitted guard; callback(error)
+    // 'error' emission via the stream's errorEmitted guard; the failed write
     // may have already destroyed, in which case this is a no-op.
-    const callback = data[kwriteCallback];
-    if (callback) {
-      data[kwriteCallback] = null;
-      callback(error);
-    }
+    completeWrite(data, error);
     if (!data.destroyed) {
       data.destroy(error);
     }
@@ -1686,20 +1697,20 @@ const SocketHandlers2 = {
   drain(socket, rejected?: number) {
     $debug("Bun.Socket drain");
     const { self } = socket.data;
-    const callback = self[kwriteCallback];
+    const req = self[kwriteCallback];
     self.connecting = false;
-    if (callback && self[kRejectedWrite] === undefined) {
+    if (req && self[kRejectedWrite] === undefined) {
       const writeChunk = self._pendingData;
       const res = rejected ?? socket.$write(writeChunk || "", self._pendingEncoding || "utf8");
       if (typeof res === "number" && res < 0) {
         // The retried send failed for good (peer gone): $write returned -errno.
         self[kBytesWritten] = socket.bytesWritten;
-        if (!holdRejectedWrite(self, socket, res, callback)) failWrite(self, res, callback);
+        if (!holdRejectedWrite(self, socket, res)) failWrite(self, res, req);
       } else if (res) {
         self[kBytesWritten] = socket.bytesWritten;
-        self._pendingData = self[kwriteCallback] = null;
+        self._pendingData = null;
         unrefAfterDrain(self, socket);
-        callback(null);
+        completeWrite(self, null);
       } else {
         self[kBytesWritten] = socket.bytesWritten;
         self._pendingData = null;
@@ -1770,11 +1781,7 @@ const SocketHandlers2 = {
     // A write that was waiting on the native drain can never complete once the
     // socket is gone - fail it so 'finish'/destroy are not stuck behind it
     // (mirrors SocketEmitEndNT).
-    const pendingWrite = self[kwriteCallback];
-    if (pendingWrite) {
-      self[kwriteCallback] = null;
-      pendingWrite($ERR_SOCKET_CLOSED());
-    }
+    if (self[kwriteCallback]) completeWrite(self, $ERR_SOCKET_CLOSED());
   },
   handshake(socket, success, verifyError) {
     $debug("Bun.Socket handshake");
@@ -1790,11 +1797,7 @@ const SocketHandlers2 = {
     const tlsError = establishedTLSError(self, error);
     if (tlsError) error = tlsError;
 
-    const callback = self[kwriteCallback];
-    if (callback) {
-      self[kwriteCallback] = null;
-      callback(error);
-    } else if (tlsError) {
+    if (!completeWrite(self, error) && tlsError) {
       // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L467-L498
       (self as TLSSocketInstance)._emitTLSError(error);
       return;
@@ -3041,11 +3044,11 @@ Socket.prototype._write = function _write(chunk, encoding, callback) {
     // adopts the fd a tick later, so hold the write until it lands rather
     // than failing it as a closed socket.
     // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/tls/wrap.js#L590-L608
-    this[kwriteCallback] = callback;
+    const req = parkWrite(this, callback);
     this._pendingData = chunk;
     this._pendingEncoding = encoding;
-    const onClose = onUpgradeWriteClose.bind(this, callback);
-    this.once(kUpgradeAttached, onUpgradeAttachedWrite.bind(this, chunk, encoding, callback, onClose));
+    const onClose = onUpgradeWriteClose.bind(this, req);
+    this.once(kUpgradeAttached, onUpgradeAttachedWrite.bind(this, chunk, encoding, req, onClose));
     this.once("close", onClose);
     return;
   }
@@ -3077,7 +3080,8 @@ Socket.prototype._write = function _write(chunk, encoding, callback) {
   if (res < 0) {
     // The kernel rejected the send outright (peer reset): $write returned the
     // negative errno; deliver it like the EBADF/EPIPE branch above.
-    if (!holdRejectedWrite(this, socket, res, callback)) callback(writeErrnoException(res));
+    if (holdRejectedWrite(this, socket, res)) parkWrite(this, callback);
+    else callback(writeErrnoException(res));
     return false;
   }
   if (res) {
@@ -3099,7 +3103,7 @@ Socket.prototype._write = function _write(chunk, encoding, callback) {
   } else if (this[kwriteCallback]) {
     callback(new Error("overlapping _write()"));
   } else {
-    this[kwriteCallback] = callback;
+    parkWrite(this, callback);
     // A pending write holds the loop even on a handle whose FIN/pause dropped
     // its hold (libuv: the uv_write_t is active); unrefAfterDrain lets go again.
     if ((this[kended] || this[kPausedUnref]) && !this[kUserUnrefed]) socket.ref?.();

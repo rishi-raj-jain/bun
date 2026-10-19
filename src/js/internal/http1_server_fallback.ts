@@ -53,7 +53,8 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
   let chunked = false;
   let noBody = false;
   let closeDelimited = false;
-  // The drain callback of a write() that reported backpressure, and its async context (native's onwritable slot).
+  // The drain callback of a write() that reported backpressure (native's onwritable slot), and its async context for a
+  // socket that closes first.
   let onwritable: ((...args: unknown[]) => void) | null | undefined = null;
   let onwritableFrame;
 
@@ -193,12 +194,14 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
     return length;
   }
 
-  // Runs `fn` once in the place of the waiting callback, in that callback's async context.
-  function settleWaiting(fn) {
+  // Runs `fn` once in the place of the waiting callback. The socket's 'drain' and 'finish' are in the async context of
+  // the write that waited. Its 'close' is not, so there `fn` runs in the waiting callback's.
+  function settleWaiting(fn, closed?) {
     const frame = onwritableFrame;
     onwritable = null;
     onwritableFrame = undefined;
-    AsyncContextFrame.run(frame, fn);
+    if (closed) AsyncContextFrame.run(frame, fn);
+    else fn();
   }
 
   // The bytes end() left in the socket are out, or the socket closed with them.
@@ -246,8 +249,8 @@ function createHttp1FallbackResponseHandle(socket, shouldKeepAlive, keepAliveTim
       if (onwritable) settleWaiting(onwritable);
     },
     // The socket finished or closed, so no 'drain' comes: `fn` runs, and the waiting callback never does.
-    socketEnded(fn) {
-      if (onwritable) settleWaiting(fn);
+    socketEnded(fn, closed?) {
+      if (onwritable) settleWaiting(fn, closed);
     },
     // Runs once, from flushed(). ServerResponse#end()'s `onwritable` stays unused: its 'finish' comes a tick later, after a closing socket's 'close'.
     onflushed: null as (() => void) | null,
@@ -684,8 +687,9 @@ function connectionListenerHTTP1(server, socket, options) {
     connections.delete(socket);
     const inflight = socket._httpMessage;
     // The write callbacks that still wait fail, before the response's 'close', as in Node.
-    inflight?.[kHttp1ResponseHandle]?.socketEnded(() =>
-      failPendingWriteCallbacks(inflight, socket.errored ?? inflight.errored ?? $ERR_STREAM_DESTROYED("write")),
+    inflight?.[kHttp1ResponseHandle]?.socketEnded(
+      () => failPendingWriteCallbacks(inflight, socket.errored ?? inflight.errored ?? $ERR_STREAM_DESTROYED("write")),
+      true,
     );
     // Like the native socket's close path (Node's socketOnClose ->
     // abortIncoming): abort the in-flight request, then the responses (and

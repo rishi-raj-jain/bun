@@ -56,6 +56,23 @@ const AsyncContextFrame = {
       $putInternalField($asyncContext, 0, prev);
     }
   },
+  /**
+   * `run()` for a call that one script left waiting on something another script's event
+   * completes: a write parked on a socket until the socket drains or closes. `frame` is only
+   * installed when it is inside the same Bun.ModuleGraph as the active frame. The event is its
+   * owner's, so what the call goes on to start (the next write, the shutdown, 'close') must not
+   * go with a graph that only wrote and was disposed since.
+   */
+  runInSameGraph(frame, fn, thisArg?, a?, b?, c?) {
+    const prev = $getInternalField($asyncContext, 0);
+    if (frame === prev || moduleGraphOfFrame(frame) !== moduleGraphOfFrame(prev)) return fn.$call(thisArg, a, b, c);
+    $putInternalField($asyncContext, 0, frame);
+    try {
+      return fn.$call(thisArg, a, b, c);
+    } finally {
+      $putInternalField($asyncContext, 0, prev);
+    }
+  },
 };
 
 export default AsyncContextFrame;

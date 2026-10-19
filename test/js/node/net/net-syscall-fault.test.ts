@@ -1,8 +1,12 @@
 import { socketFaultInjection as fault } from "bun:internal-for-testing";
 import { afterEach, describe, expect, test } from "bun:test";
-import { isWindows } from "harness";
+import { bunEnv, bunExe, tls as certs, isWindows } from "harness";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
+import http from "node:http";
 import net from "node:net";
+import tls from "node:tls";
 
 // Windows uses the libuv eventing backend; bsd_recv/bsd_send are still the
 // chokepoints there but errno semantics differ. Land POSIX coverage first.
@@ -379,6 +383,482 @@ describe.skipIf(skip)("node:net under injected syscall faults", () => {
     const [err] = (await errP) as [NodeJS.ErrnoException];
     expect(firstChunk!.toString()).toBe("first");
     expect(err.code).toBe("ECONNRESET");
+  });
+});
+
+// A write the kernel takes only part of waits for the socket's writable event. Node keeps the async context with the
+// write request, so whatever completes the write (the drain, a flush that fails, the close), its callback and what
+// follows from it run where the write was issued. Each socket here is opened in a context of its own: a callback that
+// runs where its socket was opened sees "opened".
+describe.skipIf(skip)("a write that waited for the socket completes in the async context of the write", () => {
+  const storage = new AsyncLocalStorage<string>();
+  const fdOf = (socket: net.Socket) => (socket as any)._handle.fd as number;
+  // The next send on this socket takes one byte: the rest of the write waits.
+  const takeOneByte = (socket: net.Socket) =>
+    fault.set({ syscall: "send", action: "short", bytes: 1, repeat: 1, fd: fdOf(socket) });
+
+  // The lifecycle of `socket` after a write that waited fails, with the store each event ran in.
+  function failedWrite(socket: net.Socket, fail: () => void) {
+    const events: string[] = [];
+    socket.on("error", (e: NodeJS.ErrnoException) => events.push(`error ${e.code} in ${storage.getStore()}`));
+    const { promise, resolve } = Promise.withResolvers<string[]>();
+    socket.on("close", () => resolve(events));
+    takeOneByte(socket);
+    storage.run("write", () =>
+      socket.write(Buffer.alloc(200, "w"), err =>
+        events.push(`write ${(err as NodeJS.ErrnoException)?.code} in ${storage.getStore()}`),
+      ),
+    );
+    fail();
+    return promise;
+  }
+
+  describe.each(["client", "server"] as const)("%s", side => {
+    async function pair() {
+      const p = await storage.run("opened", connectedPair);
+      const [writer, reader] = side === "client" ? [p.client, p.serverSock] : [p.serverSock, p.client];
+      return { p, writer, reader };
+    }
+
+    test("the write callback, after the drain", async () => {
+      const { p, writer } = await pair();
+      using _ = p;
+      takeOneByte(writer);
+      const { promise, resolve } = Promise.withResolvers<{ error: Error | null; store: string | undefined }>();
+      storage.run("write", () =>
+        writer.write(Buffer.alloc(200, "w"), err => resolve({ error: err ?? null, store: storage.getStore() })),
+      );
+      expect(await promise).toEqual({ error: null, store: "write" });
+    });
+
+    test("'drain', after a write over the high water mark", async () => {
+      const { p, writer, reader } = await pair();
+      using _ = p;
+      reader.resume();
+      takeOneByte(writer);
+      const { promise, resolve } = Promise.withResolvers<string | undefined>();
+      writer.once("drain", () => resolve(storage.getStore()));
+      const flushed = storage.run("write", () => writer.write(Buffer.alloc(2 * writer.writableHighWaterMark, "w")));
+      expect({ flushed, drain: await promise }).toEqual({ flushed: false, drain: "write" });
+    });
+
+    test("the end(chunk) callback and 'finish'", async () => {
+      const { p, writer } = await pair();
+      using _ = p;
+      takeOneByte(writer);
+      const stores: Record<string, string | undefined> = {};
+      const { promise, resolve } = Promise.withResolvers<void>();
+      writer.once("finish", () => (stores.finish = storage.getStore()));
+      storage.run("end", () =>
+        writer.end(Buffer.alloc(200, "w"), () => {
+          stores.callback = storage.getStore();
+          resolve();
+        }),
+      );
+      await promise;
+      expect(stores).toEqual({ finish: "end", callback: "end" });
+    });
+
+    test("the write callback and 'error', when the flush from the writable event fails", async () => {
+      const { p, writer } = await pair();
+      using _ = p;
+      const events = await failedWrite(writer, () =>
+        fault.set({ syscall: "send", action: "errno", errno: "EPIPE", repeat: 1, fd: fdOf(writer) }),
+      );
+      expect(events).toEqual(["write EPIPE in write", "error EPIPE in write"]);
+    });
+
+    test("the write callback, when destroy() closes the socket first", async () => {
+      const { p, writer } = await pair();
+      using _ = p;
+      const events = await failedWrite(writer, () => storage.run("destroy", () => writer.destroy()));
+      expect(events).toEqual(["write ERR_SOCKET_CLOSED in write"]);
+    });
+  });
+
+  // The extra pipe of a child process is a socket over an fd it adopts, which has a handler table of its own.
+  describe("a socket over an adopted fd", () => {
+    async function childPipe() {
+      const child = storage.run("opened", () =>
+        spawn(bunExe(), ["-e", "setInterval(() => {}, 60_000)"], {
+          env: bunEnv,
+          stdio: ["ignore", "ignore", "inherit", "pipe"],
+        }),
+      );
+      return {
+        writer: child.stdio[3] as net.Socket,
+        async [Symbol.asyncDispose]() {
+          child.kill();
+          await once(child, "exit");
+        },
+      };
+    }
+
+    test("the write callback, after the drain", async () => {
+      await using pipe = await childPipe();
+      takeOneByte(pipe.writer);
+      const { promise, resolve } = Promise.withResolvers<{ error: Error | null; store: string | undefined }>();
+      storage.run("write", () =>
+        pipe.writer.write(Buffer.alloc(200, "w"), err => resolve({ error: err ?? null, store: storage.getStore() })),
+      );
+      expect(await promise).toEqual({ error: null, store: "write" });
+    });
+
+    test("the write callback and one 'error', when the flush from the writable event fails", async () => {
+      await using pipe = await childPipe();
+      const events = await failedWrite(pipe.writer, () =>
+        fault.set({ syscall: "send", action: "errno", errno: "EPIPE", repeat: 1, fd: fdOf(pipe.writer) }),
+      );
+      expect(events).toEqual(["write EPIPE in write", "error EPIPE in write"]);
+    });
+  });
+
+  async function connectedTLSPair() {
+    const server = tls.createServer({ key: certs.key, cert: certs.cert });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const accepted = once(server, "secureConnection") as Promise<[tls.TLSSocket]>;
+    const client = tls.connect({
+      port: (server.address() as net.AddressInfo).port,
+      host: "127.0.0.1",
+      rejectUnauthorized: false,
+    });
+    const [[serverSock]] = await Promise.all([accepted, once(client, "secureConnect")]);
+    return {
+      client,
+      serverSock,
+      [Symbol.dispose]() {
+        client.destroy();
+        serverSock.destroy();
+        server.close();
+      },
+    };
+  }
+
+  describe.each(["client", "server"] as const)("TLS %s", side => {
+    async function pair() {
+      const p = await storage.run("opened", connectedTLSPair);
+      const [writer, reader] = side === "client" ? [p.client, p.serverSock] : [p.serverSock, p.client];
+      reader.on("error", () => {});
+      return { p, writer, reader };
+    }
+
+    test("the write callback and 'drain', when the rest of the ciphertext leaves from the writable event", async () => {
+      const { p, writer, reader } = await pair();
+      using _ = p;
+      reader.resume();
+      const stores: Record<string, string | undefined> = {};
+      const { promise, resolve } = Promise.withResolvers<void>();
+      writer.once("drain", () => {
+        stores.drain = storage.getStore();
+        resolve();
+      });
+      fault.set({ syscall: "send", action: "short", bytes: 1024, repeat: 1, fd: fdOf(writer) });
+      storage.run("write", () =>
+        writer.write(Buffer.alloc(4 * writer.writableHighWaterMark, "w"), () => (stores.callback = storage.getStore())),
+      );
+      await promise;
+      expect(stores).toEqual({ callback: "write", drain: "write" });
+    });
+
+    // The engine holds a write whose ciphertext the kernel rejected until the close that fails it.
+    test("the write callback and 'error', when the kernel rejects the ciphertext at once", async () => {
+      const { p, writer } = await pair();
+      using _ = p;
+      const events: string[] = [];
+      writer.on("error", (e: NodeJS.ErrnoException) => events.push(`error ${e.code} in ${storage.getStore()}`));
+      const closed = new Promise<void>(resolve => writer.once("close", () => resolve()));
+      fault.set({ syscall: "send", action: "errno", errno: "ECONNRESET", repeat: -1, fd: fdOf(writer) });
+      storage.run("write", () =>
+        writer.write("hello", err =>
+          events.push(`write ${(err as NodeJS.ErrnoException)?.code} in ${storage.getStore()}`),
+        ),
+      );
+      await closed;
+      expect(events).toEqual(["write ECONNRESET in write", "error ECONNRESET in write"]);
+    });
+  });
+
+  // Node's handle takes that write inside write(). Here the wrap holds it until the handle is attached.
+  test("TLS: the callback of a write issued in the tick of a server-side wrap", async () => {
+    const raw = net.createServer();
+    raw.listen(0, "127.0.0.1");
+    await once(raw, "listening");
+    const written = Promise.withResolvers<string | undefined>();
+    let secured: tls.TLSSocket | undefined;
+    raw.on("connection", socket => {
+      secured = storage.run("wrap", () => new tls.TLSSocket(socket, { isServer: true, ...certs }));
+      secured.on("error", written.reject);
+      storage.run("write", () => secured!.write("banner", () => written.resolve(storage.getStore())));
+    });
+    const client = tls.connect({
+      port: (raw.address() as net.AddressInfo).port,
+      host: "127.0.0.1",
+      rejectUnauthorized: false,
+    });
+    try {
+      client.on("error", written.reject);
+      client.resume();
+      expect(await written.promise).toBe("write");
+    } finally {
+      client.destroy();
+      secured?.destroy();
+      raw.close();
+    }
+  });
+
+  test("TLS: the end() callback and 'finish' of a socket that ends before its handshake", async () => {
+    const server = tls.createServer({ key: certs.key, cert: certs.cert }, socket => {
+      socket.on("error", () => {}).resume();
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const client = storage.run("opened", () =>
+      tls.connect({ port: (server.address() as net.AddressInfo).port, host: "127.0.0.1", rejectUnauthorized: false }),
+    );
+    try {
+      const stores: Record<string, string | undefined> = {};
+      const { promise, resolve, reject } = Promise.withResolvers<void>();
+      client.on("error", reject);
+      client.once("finish", () => (stores.finish = storage.getStore()));
+      client.once("connect", () => {
+        // The empty write completes at once, and the stream ends from inside its completion: end() only marks the end.
+        storage.run("write", () => client.write(""));
+        storage.run("end", () =>
+          client.end(() => {
+            stores.callback = storage.getStore();
+            resolve();
+          }),
+        );
+      });
+      await promise;
+      expect(stores).toEqual({ finish: "write", callback: "write" });
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
+  test("node:http: the write callback and 'drain' of the socket an 'upgrade' listener gets", async () => {
+    const stores: Record<string, string | undefined> = {};
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    const server = http.createServer();
+    server.on("upgrade", (_request, socket) => {
+      socket.on("error", reject);
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n");
+      socket.once("drain", () => {
+        stores.drain = storage.getStore();
+        resolve();
+      });
+      // The client has sent all it sends, so the next send in the process is this write's.
+      fault.set({ syscall: "send", action: "short", bytes: 1, repeat: 1 });
+      storage.run("write", () =>
+        socket.write(Buffer.alloc(2 * socket.writableHighWaterMark, "w"), () => (stores.callback = storage.getStore())),
+      );
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const client = net.connect((server.address() as net.AddressInfo).port, "127.0.0.1");
+    try {
+      client.on("error", reject);
+      client.resume();
+      client.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n");
+      await promise;
+      expect(stores).toEqual({ callback: "write", drain: "write" });
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
+  test("node:http: the callback of an 'upgrade' socket's write that the close of the connection fails", async () => {
+    // More than the kernel takes while the client does not read.
+    const big = Buffer.alloc(8 * 1024 * 1024);
+    const { promise, resolve } = Promise.withResolvers<{ failed: boolean; store: string | undefined }>();
+    const server = http.createServer();
+    server.on("upgrade", (_request, socket) => {
+      socket.on("error", () => {});
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: test\r\nConnection: Upgrade\r\n\r\n");
+      storage.run("write", () => socket.write(big, err => resolve({ failed: err != null, store: storage.getStore() })));
+      client.destroy();
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const client = net.connect((server.address() as net.AddressInfo).port, "127.0.0.1");
+    try {
+      client.on("error", () => {});
+      client.pause();
+      client.write("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n");
+      expect(await promise).toEqual({ failed: true, store: "write" });
+    } finally {
+      client.destroy();
+      server.close();
+    }
+  });
+
+  // A Bun.ModuleGraph context rides the async context too. A write on a socket that another script opened
+  // completes as that script: the rest of the socket's life must not go with a graph that only wrote.
+  describe("and Bun.ModuleGraph", () => {
+    const contextOf = (graph: Bun.ModuleGraph) =>
+      Bun.ModuleGraph.current === graph ? "the graph" : Bun.ModuleGraph.current ? "another graph" : "the host";
+
+    // The events of `socket` as they come, with the script each listener ran as.
+    function eventsOf(socket: net.Socket, graph: Bun.ModuleGraph) {
+      const events: string[] = [];
+      for (const event of ["drain", "finish", "close"]) {
+        socket.on(event, () => events.push(`'${event}' as ${contextOf(graph)}`));
+      }
+      return events;
+    }
+
+    test("on a socket of the graph's own: in the async context of the write", async () => {
+      using graph = new Bun.ModuleGraph();
+      using p = await graph.run(() => storage.run("opened", connectedPair));
+      takeOneByte(p.client);
+      const { promise, resolve } = Promise.withResolvers<{ store: string | undefined; context: string }>();
+      graph.run(() =>
+        storage.run("write", () =>
+          p.client.write(Buffer.alloc(200, "w"), () =>
+            resolve({ store: storage.getStore(), context: contextOf(graph) }),
+          ),
+        ),
+      );
+      expect(await promise).toEqual({ store: "write", context: "the graph" });
+    });
+
+    test("on a socket of the host's: 'drain' and the callback of a disposed graph's write run as the host", async () => {
+      using p = await connectedPair();
+      p.serverSock.resume();
+      const graph = new Bun.ModuleGraph();
+      const events = eventsOf(p.client, graph);
+      const drained = once(p.client, "drain");
+      takeOneByte(p.client);
+      graph.run(() =>
+        p.client.write(Buffer.alloc(2 * p.client.writableHighWaterMark, "w"), () =>
+          events.push("write callback as " + contextOf(graph)),
+        ),
+      );
+      graph.dispose();
+      await drained;
+      expect(events).toEqual(["'drain' as the host", "write callback as the host"]);
+    });
+
+    test("on a socket of the host's: the end(chunk) of a disposed graph still finishes and closes the socket", async () => {
+      // The peer's FIN comes first, so the end of the write side is what closes the socket.
+      const server = net.createServer({ allowHalfOpen: true }, socket => {
+        socket.on("error", () => {});
+        socket.end();
+        socket.resume();
+      });
+      server.listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const client = net.connect({
+        port: (server.address() as net.AddressInfo).port,
+        host: "127.0.0.1",
+        allowHalfOpen: true,
+      });
+      try {
+        client.resume();
+        await once(client, "end");
+        const graph = new Bun.ModuleGraph();
+        const events = eventsOf(client, graph);
+        const closed = once(client, "close");
+        takeOneByte(client);
+        graph.run(() => client.end(Buffer.alloc(200, "w"), () => events.push("end callback as " + contextOf(graph))));
+        graph.dispose();
+        await closed;
+        expect(events).toEqual(["end callback as the host", "'finish' as the host", "'close' as the host"]);
+      } finally {
+        client.destroy();
+        server.close();
+      }
+    });
+
+    test("on a socket of the host's: a disposed graph's write that the host's destroy() fails", async () => {
+      using p = await connectedPair();
+      const graph = new Bun.ModuleGraph();
+      const events = eventsOf(p.client, graph);
+      const closed = once(p.client, "close");
+      takeOneByte(p.client);
+      graph.run(() =>
+        p.client.write(Buffer.alloc(200, "w"), err =>
+          events.push(`write callback (${(err as NodeJS.ErrnoException)?.code}) as ${contextOf(graph)}`),
+        ),
+      );
+      graph.dispose();
+      p.client.destroy();
+      await closed;
+      expect(events).toEqual(["write callback (ERR_SOCKET_CLOSED) as the host", "'close' as the host"]);
+    });
+
+    test("on a connection of the host's Agent: the Agent serves its next request after the graph is disposed", async () => {
+      // More than the kernel takes while the peer does not read.
+      const body = Buffer.alloc(8 * 1024 * 1024);
+      let connections = 0;
+      const upload = Promise.withResolvers<net.Socket>();
+      // Speaks HTTP by hand: it answers the first request, stops reading at the second, and answers on later connections.
+      const origin = net.createServer({ allowHalfOpen: true }, socket => {
+        const first = ++connections === 1;
+        let chunks = 0;
+        socket.on("error", () => {});
+        socket.on("data", chunk => {
+          if (!first) {
+            if (chunk.includes("\r\n\r\n")) {
+              socket.end("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            }
+          } else if (++chunks === 1) {
+            socket.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok");
+          } else if (chunks === 2) {
+            socket.pause();
+            upload.resolve(socket);
+          }
+        });
+      });
+      origin.listen(0, "127.0.0.1");
+      await once(origin, "listening");
+      const port = (origin.address() as net.AddressInfo).port;
+      const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+      const get = (path: string) => {
+        const { promise, resolve, reject } = Promise.withResolvers<number | undefined>();
+        http
+          .get({ agent, port, host: "127.0.0.1", path }, response => {
+            response.resume();
+            response.on("end", () => resolve(response.statusCode));
+          })
+          .on("error", reject);
+        return promise;
+      };
+      try {
+        const pooled = once(agent, "free");
+        const first = await get("/first");
+        await pooled;
+
+        // The graph's upload goes out on the connection the host's request opened, and waits on it.
+        const graph = new Bun.ModuleGraph();
+        graph.run(() => {
+          const request = http.request({
+            agent,
+            port,
+            host: "127.0.0.1",
+            method: "POST",
+            path: "/upload",
+            headers: { "content-length": body.length },
+          });
+          request.on("error", () => {});
+          request.end(body);
+        });
+        const peer = await upload.promise;
+        graph.dispose();
+
+        // The origin refuses the upload and closes. The Agent has one connection: the next request needs a new one.
+        peer.end("HTTP/1.1 413 Payload Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+        peer.resume();
+        expect({ first, next: await get("/next"), connections }).toEqual({ first: 200, next: 200, connections: 2 });
+      } finally {
+        agent.destroy();
+        origin.close();
+      }
+    });
   });
 });
 

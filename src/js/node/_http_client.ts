@@ -544,11 +544,8 @@ function emitAbortNT(req) {
   req.emit("abort");
 }
 
+// The socket's 'drain' is in the async context of the write that waited, where Node emits the request's.
 function ondrain() {
-  return runInFrame(this._httpMessage?.[kClientAsyncContext], ondrainInner, this);
-}
-
-function ondrainInner() {
   const msg = this._httpMessage;
   if (msg && !msg.finished && msg[kNeedDrain]) {
     msg[kNeedDrain] = false;

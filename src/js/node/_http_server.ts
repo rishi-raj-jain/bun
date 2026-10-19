@@ -1651,6 +1651,11 @@ interface NetSocketBase extends Pick<NetSocket, NetSocketPrototypeAccessors>, Ne
 interface NetSocketConstructor {
   new (options?: import("node:net").SocketConstructorOpts & import("node:stream").DuplexOptions): NetSocketBase;
 }
+// The handle took the tunnel write that waited for it: the write's callback, then 'drain', where the write was issued.
+function onTunnelWriteDrained(this: NetSocket, callback: () => void) {
+  callback();
+  this.emit("drain");
+}
 function getNodeHTTPServerSocket() {
   if (NodeHTTPServerSocket) return NodeHTTPServerSocket;
   const { Socket: NetSocket }: { Socket: NetSocketConstructor } = require("node:net");
@@ -1677,7 +1682,8 @@ function getNodeHTTPServerSocket() {
     // Node's connectionListener sets socket._paused when it stops reading a
     // connection whose pipelined responses have buffered past the high water mark.
     _paused = false;
-    #pendingCallback = null;
+    // A tunnel write that waits for the handle to drain, with the async context `_write` was called in (see net.Socket's).
+    #pendingCallback: { callback: (err?: Error | null) => void; frame: unknown } | null = null;
     #pendingAbortMessage;
     #closeHandled = false;
     #peer;
@@ -1775,12 +1781,10 @@ function getNodeHTTPServerSocket() {
       }
     }
     #onDrain() {
-      const callback = this.#pendingCallback;
-      if (callback) {
-        this.#pendingCallback = null;
-        (callback as Function)();
-      }
-      this.emit("drain");
+      const write = this.#pendingCallback;
+      if (!write) return void this.emit("drain");
+      this.#pendingCallback = null;
+      require("internal/async_context_frame").runInSameGraph(write.frame, onTunnelWriteDrained, this, write.callback);
     }
     #onData(chunk, last) {
       this._unrefTimer();
@@ -1936,10 +1940,10 @@ function getNodeHTTPServerSocket() {
         this.destroy(this.#closeError);
       }
       // A tunnel write that waited for a drain fails now. After destroy(), it settles the callbacks of Writable and emits no 'error'.
-      const pendingCallback = this.#pendingCallback;
-      if (pendingCallback) {
+      const write = this.#pendingCallback;
+      if (write) {
         this.#pendingCallback = null;
-        (pendingCallback as Function)(writeFailure);
+        require("internal/async_context_frame").runInSameGraph(write.frame, write.callback, undefined, writeFailure);
       }
     }
     // The close of a TLS handle waits for ciphertext that write() reported and a stalled peer does not take, but only once.
@@ -2227,7 +2231,7 @@ function getNodeHTTPServerSocket() {
           if (!flushed && handle.ondrain) {
             // Streaming mode (CONNECT tunnels): wait for the native drain
             // callback before completing the write.
-            this.#pendingCallback = _callback;
+            this.#pendingCallback = { callback: _callback, frame: $getInternalField($asyncContext, 0) };
             return false;
           }
         }
