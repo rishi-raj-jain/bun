@@ -525,3 +525,29 @@ pub(crate) fn create_memfd_for_testing(
         }
     }
 }
+
+/// Opens `path` in the directory `dir` with `bun_sys::openat_no_symlinks` and closes it. Returns
+/// null if this system has no such open.
+#[bun_jsc::host_fn]
+pub(crate) fn openat_no_symlinks_for_testing(
+    global: &JSGlobalObject,
+    frame: &CallFrame,
+) -> JsResult<JSValue> {
+    let [dir_arg, path_arg] = frame.arguments_as_array::<2>();
+    let dir_path = dir_arg.to_bun_string(global)?;
+    let path = path_arg.to_bun_string(global)?;
+    let path = bun_core::ZBox::from_bytes(path.to_utf8().slice());
+
+    let dir = match bun_sys::Dir::open(dir_path.to_utf8().slice()) {
+        Ok(dir) => dir,
+        Err(err) => return Err(global.throw_value(err.to_js(global))),
+    };
+    match bun_sys::openat_no_symlinks(dir.fd(), &path, bun_sys::O::RDONLY, 0) {
+        None => Ok(JSValue::NULL),
+        Some(Ok(fd)) => {
+            let _ = bun_sys::close(fd);
+            Ok(JSValue::TRUE)
+        }
+        Some(Err(err)) => Err(global.throw_value(err.to_js(global))),
+    }
+}

@@ -1,4 +1,5 @@
 import { file, spawn } from "bun";
+import * as internals from "bun:internal-for-testing";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import {
   access,
@@ -1346,6 +1347,36 @@ describe("a link where the lockfile has a package from the cache", () => {
     slot: { link: false, files: ["node_modules", "package.json"], "no-deps": "1.0.1" },
     checkout: untouched,
   };
+
+  // `bun install` reads a file of an installed package with this open.
+  it.concurrent("the open for an installed package refuses a link in any folder", async () => {
+    using dir = tempDir("bun-link-open-", { real: { pkg: { "package.json": "{}" } } });
+    const root = String(dir);
+    await linkTo(join(root, "real"), join(root, "link"));
+    await linkTo(join(root, "real", "pkg"), join(root, "real", "link"));
+
+    const open = (...path: string[]) => {
+      try {
+        return internals.openatNoSymlinks(root, join(...path));
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code;
+      }
+    };
+    const results = {
+      real: open("real", "pkg", "package.json"),
+      missing: open("real", "pkg", "missing.json"),
+      "link to the folder": open("real", "link", "package.json"),
+      "link above the folder": open("link", "pkg", "package.json"),
+    };
+    // FreeBSD has no such open, and neither has a Linux that refuses `openat2`.
+    const hasOpen = isWindows || isMacOS || results.real !== null;
+    expect(results).toEqual({
+      real: hasOpen ? true : null,
+      missing: hasOpen ? "ENOENT" : null,
+      "link to the folder": hasOpen ? "ELOOP" : null,
+      "link above the folder": hasOpen ? "ELOOP" : null,
+    });
+  });
 
   // One package in each kind of place: the root, an `@scope`, below a package, below a workspace.
   const places = [
