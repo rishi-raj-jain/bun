@@ -18,15 +18,49 @@ let aws: AwsClient | undefined;
 
 let logger = console.log;
 
+// A string prints as it is. Bun.inspect prints every other value.
+function formatValue(value: unknown): string {
+  return typeof value === "string" ? value : Bun.inspect(value);
+}
+
+// Stands in for an object that follows a format string, so that node:util reads the
+// specifiers and Bun.inspect still prints the object. For %s, %d and %j the box
+// gives String(value), Number(value) and the JSON of the value.
+function box(value: any): unknown {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") {
+    return value;
+  }
+  return {
+    [Symbol.for("nodejs.util.inspect.custom")]: () => Bun.inspect(value),
+    toString: () => (typeof value.toString === "function" ? String(value) : Bun.inspect(value)),
+    valueOf: () => Number(value),
+    toJSON: (key: string) => (typeof value.toJSON === "function" ? value.toJSON(key) : value),
+  };
+}
+
+const formatSpecifier = /%[sdifjoOc%]/;
+// Loaded at the first format string. A load at start-up would slow every cold start.
+let util: typeof import("node:util") | undefined;
+
+function formatArgs(args: unknown[]): string {
+  const first = args[0];
+  if (args.length > 1 && typeof first === "string" && formatSpecifier.test(first)) {
+    util ??= import.meta.require("node:util") as typeof import("node:util");
+    return util.formatWithOptions({ customInspect: true }, ...args.map(box));
+  }
+  return args.map(formatValue).join(" ");
+}
+
 function log(level: string, ...args: any[]): void {
   if (!args.length) {
     return;
   }
-  const messages = args.map(arg => Bun.inspect(arg).replace(/\n/g, "\r"));
+  const message = formatArgs(args).replace(/\r?\n/g, "\r");
+  // `level` has no format specifier, so the console prints the string after it as it is.
   if (requestId === undefined) {
-    logger(level, ...messages);
+    logger(level, message);
   } else {
-    logger(level, `RequestId: ${requestId}`, ...messages);
+    logger(level, `RequestId: ${requestId} ${message}`);
   }
 }
 
@@ -111,7 +145,7 @@ function formatError(error: unknown): LambdaError {
   }
   return {
     errorType: "Error",
-    errorMessage: Bun.inspect(error),
+    errorMessage: formatValue(error),
   };
 }
 
