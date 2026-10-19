@@ -1983,7 +1983,8 @@ mod posix_impl {
         }
         openat(dir, path, flags, mode)
     }
-    /// `openat` without `O_NOFOLLOW` that says ELOOP for a symlink anywhere in `path`. `None`: no such open here.
+    /// Like `openat`, but fails with ELOOP if any component of `path` is a symlink. Returns `None`
+    /// if this system has no such open.
     pub fn openat_no_symlinks(
         dir: impl AsFd,
         path: &ZStr,
@@ -2000,11 +2001,12 @@ mod posix_impl {
             }
             let dir = dir.as_fd();
             let flags = flags | O::CLOEXEC;
-            // `openat2` says EINVAL for a mode that no file gets.
+            // `openat2` fails with EINVAL if a mode is given and no file is created.
             let creates = flags & O::CREAT != 0 || flags & O::TMPFILE == O::TMPFILE;
             let mode = if creates { mode } else { 0 };
             let error = |e| Error::from_code_int(e, Tag::open).with_path(path.as_bytes());
-            // What a kernel or a sandbox without `openat2` answers. `openat2` answers some of them for a path too.
+            // The errors that a kernel or a sandbox without `openat2` returns. `openat2` also
+            // returns some of them for a path.
             let missing = |e| {
                 matches!(
                     e,
@@ -2019,7 +2021,8 @@ mod posix_impl {
             };
             match super::linux_syscall::openat2_no_symlinks(dir, path, flags, mode) {
                 Ok(fd) => Some(Ok(fd)),
-                // No `openat2`, or an error about `path`? `/` opens for every process, so the same call on it tells.
+                // Either there's no `openat2` or the error is about `path`. Every process can
+                // open `/`, so the same call on `/` tells the two apart.
                 Err(e) if missing(e) => {
                     let probe = super::linux_syscall::openat2_no_symlinks(
                         dir,
@@ -4156,6 +4159,15 @@ mod windows_impl {
         // honoured. Do NOT fall back to libuv `open()` here — that returns a
         // CRT-fd-backed `Fd` and ignores the directory/nofollow flags.
         super::openat_windows_a(dir, path.as_bytes(), flags, mode)
+    }
+    /// See `openat_windows_no_reparse_a`.
+    pub fn openat_no_symlinks(
+        dir: impl AsFd,
+        path: &ZStr,
+        flags: i32,
+        mode: Mode,
+    ) -> Option<Maybe<Fd>> {
+        super::openat_windows_no_reparse_a(dir.as_fd(), path.as_bytes(), flags, mode)
     }
     /// `DuplicateHandle` with `bInheritHandle = FALSE`, the equivalent of the
     /// POSIX arm's `F_DUPFD_CLOEXEC`: libuv spawns children with
@@ -6486,6 +6498,8 @@ pub struct NtCreateFileOptions {
     pub options: u32,
     pub attributes: u32,
     pub sharing_mode: u32,
+    /// `OBJECT_ATTRIBUTES.Attributes`, for example `OBJ_DONT_REPARSE`.
+    pub object_attributes: u32,
 }
 #[cfg(windows)]
 impl Default for NtCreateFileOptions {
@@ -6496,6 +6510,7 @@ impl Default for NtCreateFileOptions {
             options: 0,
             attributes: bun_windows_sys::FILE_ATTRIBUTE_NORMAL,
             sharing_mode: FILE_SHARE,
+            object_attributes: 0,
         }
     }
 }
@@ -7045,7 +7060,7 @@ pub(crate) fn open_file_at_windows_nt_path(
         } else {
             Fd::cwd().native()
         },
-        Attributes: 0, // Note we do not use OBJ_CASE_INSENSITIVE here.
+        Attributes: options.object_attributes, // Note we do not use OBJ_CASE_INSENSITIVE here.
         SecurityDescriptor: core::ptr::null_mut(),
         SecurityQualityOfService: core::ptr::null_mut(),
     };
@@ -7087,6 +7102,12 @@ pub(crate) fn open_file_at_windows_nt_path(
             //     https://github.com/libuv/libuv/pull/3380
             attributes = w::FILE_ATTRIBUTE_HIDDEN;
             continue;
+        }
+
+        // Only an open with `OBJ_DONT_REPARSE` gets this status, and its Win32 code maps to no
+        // errno. It's what POSIX reports as ELOOP for `O_NOFOLLOW`.
+        if rc == w::NTSTATUS::REPARSE_POINT_ENCOUNTERED {
+            return Err(Error::from_code(E::ELOOP, Tag::open));
         }
 
         return match windows::Win32Error::from_nt_status(rc) {
@@ -7165,7 +7186,13 @@ pub fn open_file_at_windows(dir_fd: Fd, path: &[u16], opts: NtCreateFileOptions)
 /// POSIX-flag → NtCreateFile
 /// translation.
 #[cfg(windows)]
-fn openat_windows_impl(dir: Fd, norm: &bun_core::WStr, flags: i32, perm: Mode) -> Maybe<Fd> {
+fn openat_windows_impl(
+    dir: Fd,
+    norm: &bun_core::WStr,
+    flags: i32,
+    perm: Mode,
+    object_attributes: u32,
+) -> Maybe<Fd> {
     use bun_windows_sys::externs as w;
     if (flags & O::DIRECTORY) != 0 {
         // We interpret `O_PATH` as meaning "no iteration".
@@ -7239,6 +7266,7 @@ fn openat_windows_impl(dir: Fd, norm: &bun_core::WStr, flags: i32, perm: Mode) -
             disposition,
             options: opts,
             attributes,
+            object_attributes,
             ..Default::default()
         },
     )
@@ -7249,7 +7277,7 @@ fn openat_windows_impl(dir: Fd, norm: &bun_core::WStr, flags: i32, perm: Mode) -
 pub fn openat_windows(dir: Fd, path: &[u16], flags: i32, perm: Mode) -> Maybe<Fd> {
     let mut wbuf = bun_paths::w_path_buffer_pool::get();
     let norm = normalize_path_windows(dir, path, &mut wbuf.0[..])?;
-    openat_windows_impl(dir, norm, flags, perm)
+    openat_windows_impl(dir, norm, flags, perm, 0)
 }
 /// `openatWindowsA` — UTF-8 input.
 #[cfg(windows)]
@@ -7263,7 +7291,49 @@ pub fn openat_windows_a(dir: impl AsFd, path: &[u8], flags: i32, perm: Mode) -> 
     let wide = convert_path_u8_to_u16(&mut wbuf.0[..], path)?;
     let mut buf2 = bun_paths::w_path_buffer_pool::get();
     let norm = normalize_path_windows(dir, wide, &mut buf2.0[..])?;
-    openat_windows_impl(dir, norm, flags, perm)
+    openat_windows_impl(dir, norm, flags, perm, 0)
+}
+
+/// `openat_windows_a` that fails with ELOOP if any component of `path` is a symlink or a junction
+/// (`OBJ_DONT_REPARSE`). The kernel gets `path` as written and resolves it from `dir`, so `path`
+/// has to be relative, with no `.` or `..` component. Returns `None` for any other path and for
+/// `O::DIRECTORY`.
+#[cfg(windows)]
+pub fn openat_windows_no_reparse_a(
+    dir: Fd,
+    path: &[u8],
+    flags: i32,
+    perm: Mode,
+) -> Option<Maybe<Fd>> {
+    // A `:` is a drive or a stream.
+    let is_plain = !bun_core::strings::contains_char(path, b':')
+        && bun_core::strings::split_any(path, b"/\\")
+            .all(|component| !matches!(component, b"" | b"." | b".."));
+    if !is_plain || (flags & O::DIRECTORY) != 0 {
+        return None;
+    }
+    let mut wbuf = bun_paths::w_path_buffer_pool::get();
+    let len = match convert_path_u8_to_u16(&mut wbuf.0[..], path) {
+        Ok(wide) => wide.len(),
+        Err(err) => return Some(Err(err)),
+    };
+    if len >= wbuf.0.len() {
+        return Some(Err(Error::from_code(E::ENAMETOOLONG, Tag::open)));
+    }
+    for unit in &mut wbuf.0[..len] {
+        if *unit == b'/' as u16 {
+            *unit = b'\\' as u16;
+        }
+    }
+    wbuf.0[len] = 0;
+    let name = bun_core::WStr::from_buf(&wbuf.0[..], len);
+    Some(openat_windows_impl(
+        dir,
+        name,
+        flags,
+        perm,
+        bun_windows_sys::OBJ_DONT_REPARSE,
+    ))
 }
 
 // ── existence checks ──

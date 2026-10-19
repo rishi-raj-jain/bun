@@ -36,10 +36,10 @@ pub struct PackageInstall<'a> {
     pub(crate) node_modules: &'a NodeModulesFolder,
     pub lockfile: &'a Lockfile,
 
-    /// `verify` opens the files of the package with `NodeModulesFolder::open_file_no_links`.
+    /// When set, `verify` opens the package's files with `NodeModulesFolder::open_file_no_links`.
     pub(crate) no_links: bool,
-    /// That open did not say whether the package is there: a link is in the path, or there is
-    /// no such open here.
+    /// Set by `verify` when that open couldn't tell whether the package is installed, because a
+    /// symlink is in the path or there's no such open for this tree.
     pub(crate) refused: bool,
 }
 
@@ -1245,7 +1245,9 @@ impl<'a> PackageInstall<'a> {
                 .open_file(root_node_modules_dir, file_path)
                 .ok();
         }
-        match (self.node_modules).open_file_no_links(root_node_modules_dir, file_path) {
+        let opened =
+            (self.node_modules).open_file_no_links(root_node_modules_dir, self.lockfile, file_path);
+        match opened {
             Some(Ok(file)) => Some(file),
             Some(Err(err)) => {
                 self.refused = !matches!(err.get_errno(), sys::E::ENOENT | sys::E::ENOTDIR);

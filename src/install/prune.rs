@@ -1129,10 +1129,9 @@ impl<'a> HoistedTree<'a> {
                 };
             }
             ResolutionTag::Folder if kind == EntryKind::SymLink => return Installed::Matches,
-            // As in `PackageInstaller::is_installed`: not the copy of a package from the cache,
-            // unless it is the isolated linker's link to one.
+            // Like `PackageInstaller::is_installed`: a link isn't the copy of a package from the
+            // cache, unless the isolated linker made it.
             tag if kind == EntryKind::SymLink
-                && !cfg!(windows)
                 && tag.can_enqueue_install_task()
                 && store_link_target(&folder, alias).is_none() =>
             {

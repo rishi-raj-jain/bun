@@ -1262,11 +1262,6 @@ describe.each(["hoisted", "isolated"] as const)("when a package fails to install
 // A link in the place of one leads to a folder with its own files: the linker replaces the link
 // and installs nothing behind it.
 describe("a link where the lockfile has a package from the cache", () => {
-  // Windows has no open that refuses a link in a path, so a link with the expected name and
-  // version stays in the package's own place there.
-  const posix = it.concurrent.skipIf(isWindows);
-  const windows = it.concurrent.skipIf(!isWindows);
-
   const registry = new TestRegistry();
   beforeAll(() => registry.start());
   afterAll(() => registry.stop());
@@ -1352,7 +1347,48 @@ describe("a link where the lockfile has a package from the cache", () => {
     checkout: untouched,
   };
 
-  posix("bun add replaces the link that bun link --save wrote (#28964)", async () => {
+  // One package in each kind of place: the root, an `@scope`, below a package, below a workspace.
+  const places = [
+    join("node_modules", "no-deps"),
+    join("node_modules", "@types", "no-deps"),
+    join("node_modules", "one-dep"),
+    join("node_modules", "one-dep", "node_modules", "no-deps"),
+    join("packages", "member", "node_modules", "no-deps"),
+  ];
+  const everyPlace = {
+    ...project({
+      name: "root",
+      workspaces: ["packages/*"],
+      dependencies: { ...dependencies, "@types/no-deps": "1.0.0" },
+    }),
+    packages: {
+      member: { "package.json": JSON.stringify({ name: "member", dependencies: { "no-deps": "1.0.0" } }) },
+    },
+  };
+
+  // Installs twice. A file that the first copy of a package got is gone if the second install
+  // made another copy.
+  async function placesKept(root: string, ...flags: string[]) {
+    const { bun } = commands(root);
+    await bun(".", "install", ...flags);
+    for (const place of places) await writeFile(join(root, place, "kept.txt"), "");
+
+    await bun(".", "install", ...flags);
+    return Promise.all(places.map(place => exists(join(root, place, "kept.txt"))));
+  }
+
+  it.concurrent("bun install keeps a package that is installed", async () => {
+    using dir = tempDir("bun-link-slot-", everyPlace);
+    expect(await placesKept(String(dir))).toEqual(places.map(() => true));
+  });
+
+  // Windows needs a privilege to make a symlink to a file.
+  it.concurrent.skipIf(isWindows)("bun install keeps a package whose files are symlinks", async () => {
+    using dir = tempDir("bun-link-slot-", everyPlace);
+    expect(await placesKept(String(dir), "--backend=symlink")).toEqual(places.map(() => true));
+  });
+
+  it.concurrent("bun add replaces the link that bun link --save wrote (#28964)", async () => {
     using dir = tempDir("bun-link-slot-", { lib: folder("no-deps", "1.0.0"), app: project({ name: "app" }) });
     const root = String(dir);
     const { bun } = commands(root);
@@ -1376,7 +1412,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     });
   });
 
-  posix("bun install replaces a link to a folder with the name and the version of the package", async () => {
+  it.concurrent("bun install replaces a link to a folder with the name and the version of the package", async () => {
     using dir = tempDir("bun-link-slot-", { checkout, app });
     const root = String(dir);
     const { bun } = commands(root);
@@ -1389,7 +1425,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     expect(await stateOf(root, slot)).toEqual(replaced);
   });
 
-  posix("bun install replaces a link that stays inside node_modules", async () => {
+  it.concurrent("bun install replaces a link that stays inside node_modules", async () => {
     using dir = tempDir("bun-link-slot-", { app: { ...app, node_modules: { ".kept": checkout } } });
     const root = String(dir);
     const { bun } = commands(root);
@@ -1407,7 +1443,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     }).toEqual({ link: false, "no-deps": "1.0.1", kept: "2.0.0" });
   });
 
-  posix("bun install replaces a link at an @scope", async () => {
+  it.concurrent("bun install replaces a link at an @scope", async () => {
     using dir = tempDir("bun-link-slot-", {
       types: { "no-deps": folder("@types/no-deps", "1.0.0") },
       app: project({ name: "app", dependencies: { "@types/no-deps": "1.0.0" } }),
@@ -1427,7 +1463,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     }).toEqual({ link: false, files: published, types: ownFiles });
   });
 
-  posix("bun install replaces a link at the node_modules of a package", async () => {
+  it.concurrent("bun install replaces a link at the node_modules of a package", async () => {
     using dir = tempDir("bun-link-slot-", { nested: { "no-deps": folder("no-deps", "1.0.1") }, app });
     const root = String(dir);
     const { bun } = commands(root);
@@ -1444,7 +1480,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     }).toEqual({ link: false, files: published, nested: ownFiles });
   });
 
-  posix("bun install replaces a link in the node_modules of a workspace", async () => {
+  it.concurrent("bun install replaces a link in the node_modules of a workspace", async () => {
     using dir = tempDir("bun-link-slot-", {
       ...project({ name: "root", workspaces: ["packages/*"], dependencies: { "no-deps": "2.0.0" } }),
       packages: {
@@ -1468,7 +1504,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     }).toEqual({ link: false, files: published, lib: ownFiles });
   });
 
-  posix("bun install replaces a link in the place of a tarball", async () => {
+  it.concurrent("bun install replaces a link in the place of a tarball", async () => {
     const tarball = `${registry.registryUrl()}no-deps/-/no-deps-1.0.0.tgz`;
     using dir = tempDir("bun-link-slot-", { app: project({ name: "app", dependencies: { "no-deps": tarball } }) });
     const root = String(dir);
@@ -1486,7 +1522,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     expect({ link: await isLink(slot), own: await exists(join(slot, "own.txt")) }).toEqual({ link: false, own: false });
   });
 
-  posix("bun install does not install into the cache through a link", async () => {
+  it.concurrent("bun install does not install into the cache through a link", async () => {
     using dir = tempDir("bun-link-slot-", { app });
     const root = String(dir);
     const { bun } = commands(root);
@@ -1515,7 +1551,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     return missing;
   }
 
-  posix("bun install does not install below a link when the package in its place fails", async () => {
+  it.concurrent("bun install does not install below a link when the package in its place fails", async () => {
     using dir = tempDir("bun-link-slot-", { checkout, app });
     const root = String(dir);
     const { bun, run } = commands(root);
@@ -1535,7 +1571,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     });
   });
 
-  posix("bun install does not fail for what is below an optional package that fails", async () => {
+  it.concurrent("bun install does not fail for what is below an optional package that fails", async () => {
     using dir = tempDir("bun-link-slot-", {
       checkout,
       app: project({
@@ -1561,7 +1597,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     });
   });
 
-  posix("bun add -g replaces a bun link registration and says so", async () => {
+  it.concurrent("bun add -g replaces a bun link registration and says so", async () => {
     using dir = tempDir("bun-link-slot-", { checkout });
     const root = String(dir);
     const { bun } = commands(root);
@@ -1575,7 +1611,7 @@ describe("a link where the lockfile has a package from the cache", () => {
     expect(await stateOf(root, slot)).toEqual(replaced);
   });
 
-  posix("bun prune does not take a link for the hoisted copy of a package", async () => {
+  it.concurrent("bun prune does not take a link for the hoisted copy of a package", async () => {
     const member = { "package.json": JSON.stringify({ name: "member", dependencies: { "no-deps": "2.0.0" } }) };
     using dir = tempDir("bun-link-slot-", {
       ...project({ name: "root", workspaces: ["packages/*"], dependencies: { "no-deps": "2.0.0" } }),
@@ -1595,23 +1631,5 @@ describe("a link where the lockfile has a package from the cache", () => {
     const { stderr } = await run(".", "prune");
     expect(warnings(stderr)).toEqual([expect.stringMatching(/no-deps is not the version bun\.lock expects; keeping /)]);
     expect(await readdirSorted(copy)).toEqual(published);
-  });
-
-  windows("bun install does not install below a link in the place of a package", async () => {
-    using dir = tempDir("bun-link-slot-", { checkout, app });
-    const root = String(dir);
-    const { bun, run } = commands(root);
-    const slot = join(root, "app", "node_modules", "one-dep");
-
-    await bun("app", "install");
-    await linkTo(join(root, "checkout"), slot);
-
-    const { stderr, exitCode } = await run("app", "install");
-    expect(stderr).toContain("ELOOP: Failed to open node_modules folder for no-deps in ");
-    expect({ exitCode, link: await isLink(slot), checkout: (await stateOf(root, slot)).checkout }).toEqual({
-      exitCode: 1,
-      link: true,
-      checkout: untouched,
-    });
   });
 });

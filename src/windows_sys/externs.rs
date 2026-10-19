@@ -255,6 +255,10 @@ pub struct OBJECT_ATTRIBUTES {
     pub SecurityQualityOfService: *mut c_void,
 }
 
+/// `OBJECT_ATTRIBUTES.Attributes` (`ntdef.h`, Windows 10 1607 and later): the open fails with
+/// `STATUS_REPARSE_POINT_ENCOUNTERED` instead of following a reparse point in the name.
+pub const OBJ_DONT_REPARSE: ULONG = 0x0000_1000;
+
 /// `IO_STATUS_BLOCK` (`wdm.h`) — output param of `Nt*` file calls.
 #[repr(C)]
 pub struct IO_STATUS_BLOCK {
@@ -1005,6 +1009,8 @@ impl NTSTATUS {
     pub const OBJECT_NAME_NOT_FOUND: NTSTATUS = NTSTATUS(0xC000_0034);
     pub const OBJECT_NAME_INVALID: NTSTATUS = NTSTATUS(0xC000_0033);
     pub const NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103);
+    /// `STATUS_REPARSE_POINT_ENCOUNTERED` — an open with `OBJ_DONT_REPARSE` met a reparse point.
+    pub const REPARSE_POINT_ENCOUNTERED: NTSTATUS = NTSTATUS(0xC000_050B);
     pub const RETRY: NTSTATUS = NTSTATUS(0xC000_022D);
     pub const DIRECTORY_NOT_EMPTY: NTSTATUS = NTSTATUS(0xC000_0101);
     pub const FILE_TOO_LARGE: NTSTATUS = NTSTATUS(0xC000_0904);
