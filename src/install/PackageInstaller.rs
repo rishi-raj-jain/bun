@@ -1590,10 +1590,8 @@ impl<'a> PackageInstaller<'a> {
         }
         let string_buf = self.lockfile().buffers.string_bytes.as_slice();
         bun_core::warn!(
-            "replacing link {}{}{} with {}@{}",
-            bun_core::fmt::fmt_path(self.node_modules.path.as_slice(), Default::default()),
-            SEP as char,
-            bun_core::fmt::for_terminal(bstr::BStr::new(alias.as_bytes())),
+            "replacing link {} with {}@{}",
+            bun_core::fmt::fmt_path(path.as_bytes(), Default::default()),
             bun_core::fmt::for_terminal(bstr::BStr::new(installer.package_name.slice(string_buf))),
             bun_core::fmt::for_terminal(bstr::BStr::new(installer.package_version)),
         );
