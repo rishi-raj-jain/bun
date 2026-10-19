@@ -107,8 +107,8 @@ pub(crate) enum Source {
     ///    materialisation when actually going off-thread — and that costs no
     ///    more than the dupe it replaces.
     JsBuffer,
-    /// Owned — Blob inputs (the Blob's store may be sliced/freed independently)
-    /// and decoded data: URLs.
+    /// Owned — in-memory Blob inputs, zero bytes included (the Blob's store may
+    /// be sliced/freed independently), and decoded data: URLs.
     Owned(Vec<u8>),
     /// Owned, NUL-terminated. Read on the worker thread.
     Path(ZBox),
@@ -412,14 +412,16 @@ fn source_from_js(
         if !view.is_empty() {
             return Ok(Source::Owned(view.to_vec()));
         }
-        // Anything with a backing store but no in-memory view yet
-        // (`Bun.file()`, `Bun.s3()`, fd, …) — keep the JS object and read it
-        // through ITS OWN `.bytes()` at terminal time, so we inherit whatever
-        // that store type does (file → ReadFile, S3 → fetch, etc.) without
-        // knowing about it here.
-        if blob.store.get().is_some() {
-            return Ok(Source::Blob(Strong::create(value, global)));
-        }
+        return Ok(match blob.in_memory_view() {
+            // An in-memory blob of zero bytes (`new Blob([])`, `.slice(0, 0)`,
+            // an empty upload). The terminal reports that it holds no image.
+            Some(_) => Source::Owned(Vec::new()),
+            // `Bun.file()`, `Bun.s3()`, fd: the bytes don't exist until read.
+            // Keep the JS object and read it through ITS OWN `.bytes()` at
+            // terminal time, so we inherit whatever that store type does
+            // (file → ReadFile, S3 → fetch, etc.) without knowing about it here.
+            None => Source::Blob(Strong::create(value, global)),
+        });
     }
     Err(global.throw_invalid_arguments(format_args!(
         "Image() input must be a path string, data: URL, ArrayBuffer, TypedArray or Blob",
@@ -731,47 +733,39 @@ impl Image {
                 match unsafe {
                     JSC__JSValue__borrowBytesForOffThread(v, &raw mut ptr, &raw mut len)
                 } {
+                    // The helper answers 0 only for a detached view or buffer. An
+                    // empty one is zero bytes: it goes to the decoder like any
+                    // other input that holds no image.
                     0 => Err(PinError::Detached),
                     // FastTypedArray (≤ fastSizeLimit elements, GC-movable): tiny
                     // by definition — dupe instead of forcing JSC to copy via
                     // tryCreate(span()) + allocate a butterfly.
                     1 => {
-                        if len == 0 {
-                            Err(PinError::Detached)
-                        } else {
-                            // SAFETY: classifier guarantees `ptr[0..len]` is
-                            // valid for the duration of this call (JS thread).
-                            let copied = unsafe { bun_core::ffi::slice(ptr, len) }.to_vec();
-                            Ok((
-                                Input {
-                                    copied: Some(copied),
-                                    ..Default::default()
-                                },
-                                Pin::NONE,
-                            ))
-                        }
+                        // SAFETY: classifier guarantees `ptr[0..len]` is
+                        // valid for the duration of this call (JS thread); an
+                        // empty view's `ptr` may be null, which `ffi::slice` takes.
+                        let copied = unsafe { bun_core::ffi::slice(ptr, len) }.to_vec();
+                        Ok((
+                            Input {
+                                copied: Some(copied),
+                                ..Default::default()
+                            },
+                            Pin::NONE,
+                        ))
                     }
                     // 2: Wasteful/DataView/JSArrayBuffer, pinned by the helper (unpin when done).
                     // 3: OversizeTypedArray held without adopting an ArrayBuffer; nothing to unpin.
                     kind @ (2 | 3) => {
-                        if len == 0 {
-                            if kind == 2 {
-                                // SAFETY: helper pinned `v`; unpin before erroring.
-                                unsafe { JSC__JSValue__unpinArrayBuffer(v) };
-                            }
-                            Err(PinError::Detached)
-                        } else {
-                            // SAFETY: pinned until the returned `Pin` drops (with the job's
-                            // Js side, or the sync caller's scope).
-                            let bytes = unsafe { bun_core::ffi::slice(ptr, len) };
-                            Ok((
-                                Input {
-                                    bytes: bun_ptr::RawSlice::new(bytes),
-                                    ..Default::default()
-                                },
-                                if kind == 2 { Pin(v) } else { Pin::NONE },
-                            ))
-                        }
+                        // SAFETY: pinned until the returned `Pin` drops (with the job's
+                        // Js side, or the sync caller's scope).
+                        let bytes = unsafe { bun_core::ffi::slice(ptr, len) };
+                        Ok((
+                            Input {
+                                bytes: bun_ptr::RawSlice::new(bytes),
+                                ..Default::default()
+                            },
+                            if kind == 2 { Pin(v) } else { Pin::NONE },
+                        ))
                     }
                     _ => unreachable!(),
                 }
