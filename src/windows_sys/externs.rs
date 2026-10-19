@@ -255,10 +255,6 @@ pub struct OBJECT_ATTRIBUTES {
     pub SecurityQualityOfService: *mut c_void,
 }
 
-/// `OBJECT_ATTRIBUTES.Attributes` (`ntdef.h`, Windows 10 1607 and later): the open fails with
-/// `STATUS_REPARSE_POINT_ENCOUNTERED` instead of following a reparse point in the name.
-pub const OBJ_DONT_REPARSE: ULONG = 0x0000_1000;
-
 /// `IO_STATUS_BLOCK` (`wdm.h`) — output param of `Nt*` file calls.
 #[repr(C)]
 pub struct IO_STATUS_BLOCK {
@@ -303,6 +299,10 @@ pub const FILE_DIRECTORY_FILE: ULONG = 0x0000_0001;
 pub const FILE_SYNCHRONOUS_IO_NONALERT: ULONG = 0x0000_0020;
 pub const FILE_NON_DIRECTORY_FILE: ULONG = 0x0000_0040;
 pub const FILE_OPEN_REPARSE_POINT: ULONG = 0x0020_0000;
+
+/// `OBJECT_ATTRIBUTES.Attributes` (`ntdef.h`): a junction or a symlink in the name fails the open with
+/// `STATUS_REPARSE_POINT_ENCOUNTERED`.
+pub const OBJ_DONT_REPARSE: ULONG = 0x0000_1000;
 
 // Standard access rights (`winnt.h`).
 pub const DELETE: ACCESS_MASK = 0x0001_0000;
@@ -467,6 +467,9 @@ const _: () = {
     assert!(core::mem::size_of::<FILE_FS_VOLUME_INFORMATION>() == 24);
     assert!(core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeSerialNumber) == 8);
 };
+
+/// `FILE_FS_DEVICE_INFORMATION.Characteristics` (`wdm.h`): a network redirector owns the volume.
+pub const FILE_REMOTE_DEVICE: ULONG = 0x0000_0010;
 
 /// `DEVICE_TYPE` values (`ntddk.h`).
 pub const FILE_DEVICE_NAMED_PIPE: ULONG = 0x00000011;
@@ -1009,8 +1012,6 @@ impl NTSTATUS {
     pub const OBJECT_NAME_NOT_FOUND: NTSTATUS = NTSTATUS(0xC000_0034);
     pub const OBJECT_NAME_INVALID: NTSTATUS = NTSTATUS(0xC000_0033);
     pub const NOT_A_DIRECTORY: NTSTATUS = NTSTATUS(0xC000_0103);
-    /// `STATUS_REPARSE_POINT_ENCOUNTERED` — an open with `OBJ_DONT_REPARSE` met a reparse point.
-    pub const REPARSE_POINT_ENCOUNTERED: NTSTATUS = NTSTATUS(0xC000_050B);
     pub const RETRY: NTSTATUS = NTSTATUS(0xC000_022D);
     pub const DIRECTORY_NOT_EMPTY: NTSTATUS = NTSTATUS(0xC000_0101);
     pub const FILE_TOO_LARGE: NTSTATUS = NTSTATUS(0xC000_0904);
@@ -1260,6 +1261,8 @@ impl Win32Error {
     pub const NOT_CONNECTED: Win32Error = Win32Error(2250);
     pub const IO_REISSUE_AS_CACHED: Win32Error = Win32Error(3950);
     pub const INVALID_REPARSE_DATA: Win32Error = Win32Error(4392);
+    /// `STATUS_REPARSE_POINT_ENCOUNTERED`: `OBJ_DONT_REPARSE` met a junction or a symlink.
+    pub const REPARSE_POINT_ENCOUNTERED: Win32Error = Win32Error(4395);
 
     // — WSA pseudo-variants —
     pub const WSAEINTR: Win32Error = Win32Error(10004);

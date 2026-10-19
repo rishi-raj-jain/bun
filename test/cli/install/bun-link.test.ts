@@ -1386,20 +1386,22 @@ describe("a link where the lockfile has a package from the cache", () => {
     join("node_modules", "one-dep", "node_modules", "no-deps"),
     join("packages", "member", "node_modules", "no-deps"),
   ];
-  const everyPlace = {
-    ...project({
+  const everyPlace = (more: object = {}) =>
+    project({
       name: "root",
       workspaces: ["packages/*"],
-      dependencies: { ...dependencies, "@types/no-deps": "1.0.0" },
-    }),
-    packages: {
-      member: { "package.json": JSON.stringify({ name: "member", dependencies: { "no-deps": "1.0.0" } }) },
-    },
+      dependencies: { ...dependencies, "@types/no-deps": "1.0.0", ...more },
+    });
+  const member = { "package.json": JSON.stringify({ name: "member", dependencies: { "no-deps": "1.0.0" } }) };
+  // And one below a `file:` dependency.
+  const local = {
+    "package.json": JSON.stringify({ name: "local", version: "1.0.0", dependencies: { "no-deps": "1.0.0" } }),
   };
+  const belowLocal = join("node_modules", "local", "node_modules", "no-deps");
 
   // Installs twice. A file that the first copy of a package got is gone if the second install
   // made another copy.
-  async function placesKept(root: string, ...flags: string[]) {
+  async function placesKept(root: string, places: string[], ...flags: string[]) {
     const { bun } = commands(root);
     await bun(".", "install", ...flags);
     for (const place of places) await writeFile(join(root, place, "kept.txt"), "");
@@ -1409,14 +1411,70 @@ describe("a link where the lockfile has a package from the cache", () => {
   }
 
   it.concurrent("bun install keeps a package that is installed", async () => {
-    using dir = tempDir("bun-link-slot-", everyPlace);
-    expect(await placesKept(String(dir))).toEqual(places.map(() => true));
+    using dir = tempDir("bun-link-slot-", {
+      ...everyPlace({ local: "file:./local" }),
+      packages: { member },
+      local,
+    });
+    const kept = await placesKept(String(dir), [...places, belowLocal]);
+    expect(kept).toEqual(kept.map(() => true));
   });
 
   // Windows needs a privilege to make a symlink to a file.
   it.concurrent.skipIf(isWindows)("bun install keeps a package whose files are symlinks", async () => {
-    using dir = tempDir("bun-link-slot-", everyPlace);
-    expect(await placesKept(String(dir), "--backend=symlink")).toEqual(places.map(() => true));
+    using dir = tempDir("bun-link-slot-", { ...everyPlace(), packages: { member } });
+    expect(await placesKept(String(dir), places, "--backend=symlink")).toEqual(places.map(() => true));
+  });
+
+  // The path of a workspace is the user's, and a link in it is followed. A link below the
+  // workspace's `node_modules` is not.
+  it.concurrent.skipIf(isWindows)("bun install follows a link in the path of a workspace", async () => {
+    const dependencies = { "no-deps": "1.0.0", "@types/no-deps": "1.0.0" };
+    using dir = tempDir("bun-link-slot-", {
+      ...project({
+        name: "root",
+        workspaces: ["packages/*"],
+        dependencies: { "no-deps": "2.0.0", "@types/no-deps": "2.0.0" },
+      }),
+      real: { member: { "package.json": JSON.stringify({ name: "member", dependencies }) } },
+      lib: folder("no-deps", "1.0.0"),
+    });
+    const root = String(dir);
+    const { bun } = commands(root);
+    const nodeModules = join(root, "real", "member", "node_modules");
+    const kept = [join(nodeModules, "no-deps", "kept.txt"), join(nodeModules, "@types", "no-deps", "kept.txt")];
+    await symlink(join(root, "real"), join(root, "packages"), "dir");
+
+    await bun(".", "install");
+    for (const file of kept) await writeFile(file, "");
+    await bun(".", "install");
+    expect(await Promise.all(kept.map(file => exists(file)))).toEqual([true, true]);
+
+    const slot = join(nodeModules, "no-deps");
+    await linkTo(join(root, "lib"), slot);
+    await bun(".", "install");
+    expect({
+      link: await isLink(slot),
+      files: await readdirSorted(slot),
+      lib: await readdirSorted(join(root, "lib")),
+      kept: await exists(kept[1]),
+    }).toEqual({ link: false, files: published, lib: ownFiles, kept: true });
+  });
+
+  it.concurrent("bun install replaces the link that bun link wrote without --save", async () => {
+    using dir = tempDir("bun-link-slot-", { checkout, app });
+    const root = String(dir);
+    const { bun } = commands(root);
+    const slot = join(root, "app", "node_modules", "one-dep");
+
+    await bun("checkout", "link");
+    await bun("app", "install");
+    await bun("app", "link", "one-dep");
+    expect(await isLink(slot)).toBe(true);
+
+    const { stderr } = await bun("app", "install");
+    expect(warnings(stderr)).toEqual([expect.stringMatching(/^warn: replacing link .*one-dep with one-dep@1\.0\.0$/)]);
+    expect(await stateOf(root, slot)).toEqual(replaced);
   });
 
   it.concurrent("bun add replaces the link that bun link --save wrote (#28964)", async () => {
@@ -1522,6 +1580,30 @@ describe("a link where the lockfile has a package from the cache", () => {
     const root = String(dir);
     const { bun } = commands(root);
     const slot = join(root, "packages", "member", "node_modules", "no-deps");
+
+    await bun(".", "install");
+    expect(await versionOf(slot)).toBe("1.0.0");
+    await linkTo(join(root, "lib"), slot);
+
+    await bun(".", "install");
+    expect({
+      link: await isLink(slot),
+      files: await readdirSorted(slot),
+      lib: await readdirSorted(join(root, "lib")),
+    }).toEqual({ link: false, files: published, lib: ownFiles });
+  });
+
+  it.concurrent("bun install replaces a link in the node_modules of a file: dependency", async () => {
+    using dir = tempDir("bun-link-slot-", {
+      ...project({ name: "root", dependencies: { "no-deps": "2.0.0", local: "file:./local" } }),
+      local: {
+        "package.json": JSON.stringify({ name: "local", version: "1.0.0", dependencies: { "no-deps": "1.0.0" } }),
+      },
+      lib: folder("no-deps", "1.0.0"),
+    });
+    const root = String(dir);
+    const { bun } = commands(root);
+    const slot = join(root, "node_modules", "local", "node_modules", "no-deps");
 
     await bun(".", "install");
     expect(await versionOf(slot)).toBe("1.0.0");

@@ -4160,14 +4160,27 @@ mod windows_impl {
         // CRT-fd-backed `Fd` and ignores the directory/nofollow flags.
         super::openat_windows_a(dir, path.as_bytes(), flags, mode)
     }
-    /// See `openat_windows_no_reparse_a`.
+    /// Like `openat`, but fails with ELOOP if any name in `path` is a junction or a symlink. The
+    /// kernel resolves `path` from `dir`, so it has to be relative, with no `.` or `..` name. On a
+    /// volume for which `is_remote_device` is true, a junction doesn't fail the open.
     pub fn openat_no_symlinks(
         dir: impl AsFd,
         path: &ZStr,
         flags: i32,
         mode: Mode,
     ) -> Option<Maybe<Fd>> {
-        super::openat_windows_no_reparse_a(dir.as_fd(), path.as_bytes(), flags, mode)
+        let mut wbuf = bun_paths::w_path_buffer_pool::get();
+        let wide = match super::convert_path_u8_to_u16(&mut wbuf.0[..], path.as_bytes()) {
+            Ok(wide) => wide,
+            Err(err) => return Some(Err(err)),
+        };
+        Some(super::openat_windows_below(
+            dir.as_fd(),
+            wide,
+            flags,
+            mode,
+            bun_windows_sys::OBJ_DONT_REPARSE,
+        ))
     }
     /// `DuplicateHandle` with `bInheritHandle = FALSE`, the equivalent of the
     /// POSIX arm's `F_DUPFD_CLOEXEC`: libuv spawns children with
@@ -6480,6 +6493,8 @@ pub struct WindowsOpenDirOptions {
     pub no_follow: bool,
     pub can_rename_or_delete: bool,
     pub op: WindowsOpenDirOp,
+    /// `OBJECT_ATTRIBUTES.Attributes`.
+    pub object_attributes: u32,
 }
 #[cfg(windows)]
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -6498,7 +6513,7 @@ pub struct NtCreateFileOptions {
     pub options: u32,
     pub attributes: u32,
     pub sharing_mode: u32,
-    /// `OBJECT_ATTRIBUTES.Attributes`, for example `OBJ_DONT_REPARSE`.
+    /// `OBJECT_ATTRIBUTES.Attributes`.
     pub object_attributes: u32,
 }
 #[cfg(windows)]
@@ -6987,7 +7002,7 @@ pub(crate) fn open_dir_at_windows_nt_path(
         } else {
             Fd::cwd().native()
         },
-        Attributes: 0, // Note we do not use OBJ_CASE_INSENSITIVE here.
+        Attributes: options.object_attributes, // Note we do not use OBJ_CASE_INSENSITIVE here.
         ObjectName: &mut nt_name,
         SecurityDescriptor: core::ptr::null_mut(),
         SecurityQualityOfService: core::ptr::null_mut(),
@@ -7104,12 +7119,6 @@ pub(crate) fn open_file_at_windows_nt_path(
             continue;
         }
 
-        // Only an open with `OBJ_DONT_REPARSE` gets this status, and its Win32 code maps to no
-        // errno. It's what POSIX reports as ELOOP for `O_NOFOLLOW`.
-        if rc == w::NTSTATUS::REPARSE_POINT_ENCOUNTERED {
-            return Err(Error::from_code(E::ELOOP, Tag::open));
-        }
-
         return match windows::Win32Error::from_nt_status(rc) {
             windows::Win32Error::SUCCESS => {
                 if (options.access_mask & w::FILE_APPEND_DATA) != 0 {
@@ -7186,14 +7195,7 @@ pub fn open_file_at_windows(dir_fd: Fd, path: &[u16], opts: NtCreateFileOptions)
 /// POSIX-flag → NtCreateFile
 /// translation.
 #[cfg(windows)]
-fn openat_windows_impl(
-    dir: Fd,
-    norm: &bun_core::WStr,
-    flags: i32,
-    perm: Mode,
-    object_attributes: u32,
-) -> Maybe<Fd> {
-    use bun_windows_sys::externs as w;
+fn openat_windows_impl(dir: Fd, norm: &bun_core::WStr, flags: i32, perm: Mode) -> Maybe<Fd> {
     if (flags & O::DIRECTORY) != 0 {
         // We interpret `O_PATH` as meaning "no iteration".
         return open_dir_at_windows_nt_path(
@@ -7208,6 +7210,13 @@ fn openat_windows_impl(
         );
     }
 
+    open_file_at_windows_nt_path(dir, norm, nt_file_options(flags, perm))
+}
+
+/// What `NtCreateFile` gets for the POSIX `flags` and `perm` of a file open.
+#[cfg(windows)]
+fn nt_file_options(flags: i32, perm: Mode) -> NtCreateFileOptions {
+    use bun_windows_sys::externs as w;
     let nonblock = (flags & O::NONBLOCK) != 0;
 
     // Matches libuv fs__open: O_RDONLY asks for read access only. GENERIC_WRITE
@@ -7258,18 +7267,13 @@ fn openat_windows_impl(
         attributes |= w::FILE_ATTRIBUTE_READONLY;
     }
 
-    open_file_at_windows_nt_path(
-        dir,
-        norm,
-        NtCreateFileOptions {
-            access_mask,
-            disposition,
-            options: opts,
-            attributes,
-            object_attributes,
-            ..Default::default()
-        },
-    )
+    NtCreateFileOptions {
+        access_mask,
+        disposition,
+        options: opts,
+        attributes,
+        ..Default::default()
+    }
 }
 
 /// `openatWindows` — UTF-16 input.
@@ -7277,7 +7281,7 @@ fn openat_windows_impl(
 pub fn openat_windows(dir: Fd, path: &[u16], flags: i32, perm: Mode) -> Maybe<Fd> {
     let mut wbuf = bun_paths::w_path_buffer_pool::get();
     let norm = normalize_path_windows(dir, path, &mut wbuf.0[..])?;
-    openat_windows_impl(dir, norm, flags, perm, 0)
+    openat_windows_impl(dir, norm, flags, perm)
 }
 /// `openatWindowsA` — UTF-8 input.
 #[cfg(windows)]
@@ -7291,49 +7295,95 @@ pub fn openat_windows_a(dir: impl AsFd, path: &[u8], flags: i32, perm: Mode) -> 
     let wide = convert_path_u8_to_u16(&mut wbuf.0[..], path)?;
     let mut buf2 = bun_paths::w_path_buffer_pool::get();
     let norm = normalize_path_windows(dir, wide, &mut buf2.0[..])?;
-    openat_windows_impl(dir, norm, flags, perm, 0)
+    openat_windows_impl(dir, norm, flags, perm)
 }
 
-/// `openat_windows_a` that fails with ELOOP if any component of `path` is a symlink or a junction
-/// (`OBJ_DONT_REPARSE`). The kernel gets `path` as written and resolves it from `dir`, so `path`
-/// has to be relative, with no `.` or `..` component. Returns `None` for any other path and for
-/// `O::DIRECTORY`.
+// ── opens below a directory handle ──
+//
+// `path` stays relative to `RootDirectory`. `normalize_path_windows` makes an
+// absolute name of it, which `NtCreateFile` resolves from the volume again.
+//
+// `object_attributes` is 0 or `OBJ_DONT_REPARSE`. With `OBJ_DONT_REPARSE`, a
+// junction or a symlink in `path` fails the call with ELOOP. A server resolves
+// the paths below a handle for which `is_remote_device` is true, so the flag
+// refuses no junction there.
+
+/// `path` for `NtCreateFile` below a directory handle: `\` between the names, and no root, `.`, `..` or empty name.
 #[cfg(windows)]
-pub fn openat_windows_no_reparse_a(
+fn nt_name_below<'a>(path: &[u16], buf: &'a mut [u16]) -> Maybe<&'a bun_core::WStr> {
+    const DOT: u16 = b'.' as u16;
+    if path.len() >= buf.len() {
+        return Err(Error::from_code(E::ENAMETOOLONG, Tag::open));
+    }
+    let mut len = 0usize;
+    for name in path.split(|c| bun_paths::is_sep_any_t::<u16>(*c)) {
+        if matches!(name, [] | [DOT] | [DOT, DOT]) {
+            return Err(Error::from_code(E::EINVAL, Tag::open));
+        }
+        if len != 0 {
+            buf[len] = b'\\' as u16;
+            len += 1;
+        }
+        buf[len..len + name.len()].copy_from_slice(name);
+        len += name.len();
+    }
+    buf[len] = 0;
+    Ok(bun_core::WStr::from_buf(&buf[..], len))
+}
+
+/// `openat_windows` below `dir`. A directory opens with `O::DIRECTORY`, and `O::CREAT` makes it.
+#[cfg(windows)]
+pub fn openat_windows_below(
     dir: Fd,
-    path: &[u8],
+    path: &[u16],
     flags: i32,
     perm: Mode,
-) -> Option<Maybe<Fd>> {
-    // A `:` is a drive or a stream.
-    let is_plain = !bun_core::strings::contains_char(path, b':')
-        && bun_core::strings::split_any(path, b"/\\")
-            .all(|component| !matches!(component, b"" | b"." | b".."));
-    if !is_plain || (flags & O::DIRECTORY) != 0 {
-        return None;
+    object_attributes: u32,
+) -> Maybe<Fd> {
+    let mut buf = bun_paths::w_path_buffer_pool::get();
+    let name = nt_name_below(path, &mut buf.0[..])?;
+    if (flags & O::DIRECTORY) != 0 {
+        return open_dir_at_windows_nt_path(
+            dir,
+            name,
+            WindowsOpenDirOptions {
+                iterable: (flags & O::PATH) == 0,
+                no_follow: (flags & O::NOFOLLOW) != 0,
+                op: if (flags & O::CREAT) != 0 {
+                    WindowsOpenDirOp::OpenOrCreate
+                } else {
+                    WindowsOpenDirOp::OnlyOpen
+                },
+                object_attributes,
+                ..Default::default()
+            },
+        );
     }
-    let mut wbuf = bun_paths::w_path_buffer_pool::get();
-    let len = match convert_path_u8_to_u16(&mut wbuf.0[..], path) {
-        Ok(wide) => wide.len(),
-        Err(err) => return Some(Err(err)),
+    let mut options = nt_file_options(flags, perm);
+    options.object_attributes = object_attributes;
+    open_file_at_windows_nt_path(dir, name, options)
+}
+
+/// Whether a network redirector owns the volume of `fd`: then a server resolves the paths below `fd`.
+#[cfg(windows)]
+pub fn is_remote_device(fd: Fd) -> Maybe<bool> {
+    use bun_windows_sys::externs as w;
+    let mut io: w::IO_STATUS_BLOCK = bun_core::ffi::zeroed();
+    let mut device: w::FILE_FS_DEVICE_INFORMATION = bun_core::ffi::zeroed();
+    // SAFETY: FFI; `fd` is a live HANDLE and `device` is valid for write.
+    let rc = unsafe {
+        w::ntdll::NtQueryVolumeInformationFile(
+            fd.native(),
+            &mut io,
+            core::ptr::from_mut(&mut device).cast(),
+            core::mem::size_of::<w::FILE_FS_DEVICE_INFORMATION>() as u32,
+            w::FS_INFORMATION_CLASS::FileFsDeviceInformation,
+        )
     };
-    if len >= wbuf.0.len() {
-        return Some(Err(Error::from_code(E::ENAMETOOLONG, Tag::open)));
+    if w::NT_ERROR(rc) {
+        return Err(Error::new(rc, Tag::fstat).with_fd(fd));
     }
-    for unit in &mut wbuf.0[..len] {
-        if *unit == b'/' as u16 {
-            *unit = b'\\' as u16;
-        }
-    }
-    wbuf.0[len] = 0;
-    let name = bun_core::WStr::from_buf(&wbuf.0[..], len);
-    Some(openat_windows_impl(
-        dir,
-        name,
-        flags,
-        perm,
-        bun_windows_sys::OBJ_DONT_REPARSE,
-    ))
+    Ok((device.Characteristics & w::FILE_REMOTE_DEVICE) != 0)
 }
 
 // ── existence checks ──

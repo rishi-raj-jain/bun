@@ -13,7 +13,7 @@ use bun_threading::work_pool::Task as WorkPoolTask;
 #[cfg(windows)]
 use bun_threading::{IntrusiveWorkTask, ThreadPool, WaitGroup};
 
-use crate::package_installer::NodeModulesFolder;
+use crate::package_installer::{Anchor, NodeModulesFolder};
 use crate::{
     BuntagHashBuf, DependencyID, Integrity, Lockfile, Npm, PackageID, PackageManager, Resolution,
     TruncatedPackageNameHash, bun_fs, bun_json, buntaghashbuf_make, initialize_store, resolution,
@@ -36,11 +36,18 @@ pub struct PackageInstall<'a> {
     pub(crate) node_modules: &'a NodeModulesFolder,
     pub lockfile: &'a Lockfile,
 
-    /// When set, `verify` opens the package's files with `NodeModulesFolder::open_file_no_links`.
-    pub(crate) no_links: bool,
-    /// Set by `verify` when that open couldn't tell whether the package is installed, because a
-    /// symlink is in the path or there's no such open for this tree.
-    pub(crate) refused: bool,
+    /// Set by `verify` when the no-links open of an `Anchor` couldn't tell whether the package is
+    /// installed.
+    pub(crate) refused: Option<Refused>,
+}
+
+/// Why a no-links open couldn't tell whether a package is installed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// The open failed for the path: a link is in it, or a name that the open doesn't take.
+    Path,
+    /// This system has no such open.
+    NoOpen,
 }
 
 /// The file work of a `PackageInstall`. No lockfile and no manager, so any thread can do it.
@@ -1182,7 +1189,12 @@ pub(crate) fn tarball_tag_matches(tag: &[u8], integrity: &Integrity, skips_verif
 }
 
 impl<'a> PackageInstall<'a> {
-    fn verify_patch_hash(&mut self, patch: Patch, root_node_modules_dir: &Dir) -> bool {
+    fn verify_patch_hash(
+        &mut self,
+        patch: Patch,
+        root_node_modules_dir: &Dir,
+        anchor: Option<Anchor<'_>>,
+    ) -> bool {
         // hash from the .patch file, to be checked against bun tag
         let patchfile_contents_hash = patch.contents_hash;
         let mut buf: BuntagHashBuf = BuntagHashBuf::default();
@@ -1192,6 +1204,15 @@ impl<'a> PackageInstall<'a> {
             self.destination_dir_subpath.as_bytes(),
             bunhashtag,
         ]);
+
+        if anchor.is_some() {
+            let Some(tag) = self.open_installed(root_node_modules_dir, anchor, patch_tag_path)
+            else {
+                return false;
+            };
+            let _ = tag.close(); // close error is non-actionable
+            return true;
+        }
 
         let Ok(destination_dir) = self.node_modules.open_dir(root_node_modules_dir) else {
             return false;
@@ -1219,6 +1240,7 @@ impl<'a> PackageInstall<'a> {
         &mut self,
         matches: &dyn Fn(&[u8]) -> bool,
         root_node_modules_dir: &Dir,
+        anchor: Option<Anchor<'_>>,
     ) -> bool {
         let mut spill = Vec::new();
         let bun_tag_path = path::resolve_path::join_z_spill::<path::platform::Posix>(
@@ -1226,7 +1248,8 @@ impl<'a> PackageInstall<'a> {
             &[self.destination_dir_subpath.as_bytes(), BUN_TAG],
         );
 
-        let Some(bun_tag_file) = self.open_installed(root_node_modules_dir, bun_tag_path) else {
+        let Some(bun_tag_file) = self.open_installed(root_node_modules_dir, anchor, bun_tag_path)
+        else {
             return false;
         };
         let bytes = bun_tag_file.read_to_end_small().unwrap_or_default();
@@ -1234,38 +1257,43 @@ impl<'a> PackageInstall<'a> {
         matches(&bytes)
     }
 
-    /// Opens a file of the installed package for `verify`.
+    /// Opens a file of the installed package for `verify`. With `anchor`, a link in a folder of
+    /// the path doesn't lead to the file: the open is refused and `self.refused` says so.
     fn open_installed(
         &mut self,
         root_node_modules_dir: &Dir,
+        anchor: Option<Anchor<'_>>,
         file_path: &ZStr,
     ) -> Option<sys::File> {
-        if !self.no_links {
+        let Some(anchor) = anchor else {
             return (self.node_modules)
                 .open_file(root_node_modules_dir, file_path)
                 .ok();
-        }
-        let opened =
-            (self.node_modules).open_file_no_links(root_node_modules_dir, self.lockfile, file_path);
-        match opened {
-            Some(Ok(file)) => Some(file),
+        };
+        match anchor.open(file_path.as_bytes(), sys::O::RDONLY) {
+            Some(Ok(fd)) => Some(sys::File::from_fd(fd)),
             Some(Err(err)) => {
-                self.refused = !matches!(err.get_errno(), sys::E::ENOENT | sys::E::ENOTDIR);
+                if !matches!(err.get_errno(), sys::E::ENOENT | sys::E::ENOTDIR) {
+                    self.refused = Some(Refused::Path);
+                }
                 None
             }
             None => {
-                self.refused = true;
+                self.refused = Some(Refused::NoOpen);
                 None
             }
         }
     }
 
+    /// With `anchor`, the files of a package from the cache are opened from it, and no link in a
+    /// folder of the path is followed.
     pub(crate) fn verify(
         &mut self,
         resolution: &Resolution,
         integrity: &Integrity,
         skips_verify: bool,
         root_node_modules_dir: &Dir,
+        anchor: Option<Anchor<'_>>,
     ) -> bool {
         let verified = match resolution.tag {
             resolution::Tag::Git | resolution::Tag::Github => {
@@ -1277,11 +1305,13 @@ impl<'a> PackageInstall<'a> {
                 self.verify_bun_tag(
                     &|tag| strings::eql_long(resolved, tag, true),
                     root_node_modules_dir,
+                    anchor,
                 )
             }
             resolution::Tag::LocalTarball | resolution::Tag::RemoteTarball => self.verify_bun_tag(
                 &|tag| tarball_tag_matches(tag, integrity, skips_verify),
                 root_node_modules_dir,
+                anchor,
             ),
             resolution::Tag::Root => self.verify_directory_exists(root_node_modules_dir),
             resolution::Tag::Symlink | resolution::Tag::Workspace => {
@@ -1298,11 +1328,12 @@ impl<'a> PackageInstall<'a> {
                     self.verify_directory_exists(root_node_modules_dir)
                 }
             }
-            _ => self.verify_package_json_name_and_version(root_node_modules_dir),
+            _ => self.verify_package_json_name_and_version(root_node_modules_dir, anchor),
         };
 
         verified
-            && (self.patch).is_none_or(|patch| self.verify_patch_hash(patch, root_node_modules_dir))
+            && (self.patch)
+                .is_none_or(|patch| self.verify_patch_hash(patch, root_node_modules_dir, anchor))
     }
 
     // Only check for destination directory in node_modules. We can't use package.json because
@@ -1342,6 +1373,7 @@ impl<'a> PackageInstall<'a> {
     fn get_installed_package_json_source(
         &mut self,
         root_node_modules_dir: &Dir,
+        anchor: Option<Anchor<'_>>,
         mutable: &mut MutableString,
         until_eof: bool,
     ) -> Option<bun_ast::Source> {
@@ -1355,7 +1387,8 @@ impl<'a> PackageInstall<'a> {
             &[self.destination_dir_subpath.as_bytes(), b"package.json"],
         );
 
-        let package_json_file = self.open_installed(root_node_modules_dir, package_json_path)?;
+        let package_json_file =
+            self.open_installed(root_node_modules_dir, anchor, package_json_path)?;
 
         // Heuristic: most package.jsons will be less than 2048 bytes.
         loop {
@@ -1377,11 +1410,15 @@ impl<'a> PackageInstall<'a> {
         ))
     }
 
-    fn verify_package_json_name_and_version(&mut self, root_node_modules_dir: &Dir) -> bool {
+    fn verify_package_json_name_and_version(
+        &mut self,
+        root_node_modules_dir: &Dir,
+        anchor: Option<Anchor<'_>>,
+    ) -> bool {
         // The first attempt treats a short read as the end of the file, which saves a `read` call.
         // A few file systems return short reads earlier and truncate the JSON, so retry until EOF.
-        self.verify_installed_package_json(root_node_modules_dir, false)
-            .or_else(|| self.verify_installed_package_json(root_node_modules_dir, true))
+        self.verify_installed_package_json(root_node_modules_dir, anchor, false)
+            .or_else(|| self.verify_installed_package_json(root_node_modules_dir, anchor, true))
             .unwrap_or(false)
     }
 
@@ -1389,6 +1426,7 @@ impl<'a> PackageInstall<'a> {
     fn verify_installed_package_json(
         &mut self,
         root_node_modules_dir: &Dir,
+        anchor: Option<Anchor<'_>>,
         until_eof: bool,
     ) -> Option<bool> {
         let mut body_pool = Npm::Registry::BodyPool::get();
@@ -1399,9 +1437,12 @@ impl<'a> PackageInstall<'a> {
         // Don't keep it open while we're parsing the JSON.
         // The longer the file stays open, the more likely it causes issues for
         // other processes on Windows.
-        let Some(source) =
-            self.get_installed_package_json_source(root_node_modules_dir, mutable, until_eof)
-        else {
+        let Some(source) = self.get_installed_package_json_source(
+            root_node_modules_dir,
+            anchor,
+            mutable,
+            until_eof,
+        ) else {
             return Some(false);
         };
         let source = &source;
